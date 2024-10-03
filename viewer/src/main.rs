@@ -1,48 +1,68 @@
 #![allow(clippy::too_many_arguments)]
-use std::net;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
+use bevy::color::palettes::css::DARK_GREEN;
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::gltf::GltfExtras;
 use bevy::input::common_conditions::input_toggle_active;
 use bevy::prelude::*;
-use bevy::render::render_asset::RenderAssetUsages;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::PrimaryWindow;
 use bevy_inspector_egui::bevy_egui::EguiContexts;
 use bevy_mod_raycast::prelude::*;
-use noise::core::open_simplex::open_simplex_2d;
-use noise::permutationtable::PermutationTable;
+use city_gen::WayType;
+use pan_camera::{PanCamera, PanCamera2dBundle};
 
-mod asset_reader;
 mod city_gen;
-mod orbit_camera;
+mod pan_camera;
 
 #[derive(Resource)]
-struct MapFile(String);
+struct RoadNetworkResource(crate::city_gen::RoadNetwork);
 
-#[derive(Resource)]
-struct RoadNetwork(crate::city_gen::RoadNetwork);
-
-impl RoadNetwork {
+impl RoadNetworkResource {
     fn new(segment_count_limit: usize) -> Self {
         Self(city_gen::generate_segments(segment_count_limit))
     }
+
+    fn to_lua(&self) -> String {
+        let mut result = vec![];
+
+        for edge in self.0.graph.edge_indices() {
+            let (a, b) = self.0.graph.edge_endpoints(edge).unwrap();
+            let a = &self.0.graph[a];
+            let b = &self.0.graph[b];
+
+            let edge_weight = self.0.graph.edge_weight(edge).unwrap();
+            let is_highway = match edge_weight {
+                WayType::Highway => true,
+                WayType::Normal => false,
+            };
+
+            result.push(format!(
+                "map.spawn_road {{ src = {{ {}, {} }}, dst = {{ {}, {} }}, highway = {} }}",
+                a.position.x / 4., a.position.y / 4., b.position.x / 4., b.position.y / 4., is_highway
+            ));
+        }
+
+        result.join("\n")
+    }
 }
 
-fn main() {
-    let file = std::env::args().nth(1).unwrap_or_default();
+// #[derive(Resource)]
+// struct Rapier()
 
-    if std::env::args().len() < 2 || file.starts_with('-') {
-        println!("Usage: {} scene.gltf", std::env::args().next().unwrap());
-        return;
-    }
+fn main() {
+    // let file = std::env::args().nth(1).unwrap_or_default();
+
+    // if std::env::args().len() < 2 || file.starts_with('-') {
+    //     println!("Usage: {} scene.gltf", std::env::args().next().unwrap());
+    //     return;
+    // }
 
     App::new()
         .add_plugins((
-            asset_reader::AssetReaderPlugin,
             DefaultPlugins,
-            orbit_camera::OrbitCameraPlugin,
+            // orbit_camera::OrbitCameraPlugin,
+            pan_camera::PanCamera2dPlugin,
             FrameTimeDiagnosticsPlugin,
             LogDiagnosticsPlugin {
                 wait_duration: Duration::from_millis(1000),
@@ -52,29 +72,29 @@ fn main() {
             bevy_inspector_egui::quick::WorldInspectorPlugin::default()
                 .run_if(input_toggle_active(false, KeyCode::F12)),
         ))
-        .add_systems(Startup, (spawn_environment, spawn_scene))
+        .add_systems(Startup, spawn_environment)
         .add_systems(Update, mouse_move)
         .add_systems(Update, show_gizmos)
         .add_systems(Update, ui)
-        .insert_resource(ClearColor(Color::rgb(0., 0., 0.)))
+        .insert_resource(ClearColor(Color::srgb(0., 0., 0.)))
         .insert_resource(AmbientLight {
             color: Color::WHITE,
             brightness: 300.,
         })
         .insert_resource(Msaa::default())
-        .insert_resource(MapFile(file))
-        .insert_resource(RoadNetwork::new(1))
+        // .insert_resource(MapFile(file))
+        .insert_resource(RoadNetworkResource::new(400))
         .init_resource::<Highlighted>()
         .run();
 }
 
 fn ui(
     mut commands: Commands,
-    mut contexts: EguiContexts,
+    mut egui_contexts: EguiContexts,
     mut limit: Local<usize>,
     mut limit_txt: Local<String>,
 ) {
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = egui_contexts.try_ctx_mut() else { return };
 
     bevy_inspector_egui::egui::Window::new("")
         .title_bar(false)
@@ -89,7 +109,17 @@ fn ui(
             if ui.button("regenerate").clicked() {
                 *limit += 1;
                 *limit_txt = limit.to_string();
-                commands.insert_resource(RoadNetwork::new(*limit));
+                commands.insert_resource(RoadNetworkResource::new(*limit));
+            }
+
+            if ui.button("write to file").clicked() {
+                commands.add(|world: &mut World| {
+                    let network = world.get_resource::<RoadNetworkResource>().unwrap();
+                    let mut file = std::fs::File::create("map.lua").unwrap();
+                    let text = network.to_lua();
+                    use std::io::Write;
+                    file.write_all(text.as_bytes()).unwrap();
+                });
             }
         });
 }
@@ -98,9 +128,11 @@ fn show_gizmos(
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform)>,
     mut gizmos: Gizmos,
-    network: Res<RoadNetwork>,
-    mut contexts: EguiContexts,
+    network: Res<RoadNetworkResource>,
+    mut egui_contexts: EguiContexts,
 ) {
+    let Some(ctx) = egui_contexts.try_ctx_mut() else { return };
+
     crate::city_gen::draw_segments(&mut gizmos, &network.0);
 
     let intersect = (|| {
@@ -108,7 +140,7 @@ fn show_gizmos(
         let (camera, gxform) = camera_query.get_single().ok()?;
         let cursor_position = window.cursor_position()?;
         let cursor_ray = camera.viewport_to_world(gxform, cursor_position)?;
-        cursor_ray.intersect_plane(Vec3::ZERO, Plane3d::new(Vec3::Z))
+        cursor_ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Z))
             .map(|pos| cursor_ray.origin + cursor_ray.direction * pos)
     })();
 
@@ -119,8 +151,6 @@ fn show_gizmos(
     //         gizmos.line_2d(Vec2::new(10000., 10000.), p2, Color::RED);
     //     }
     // }
-
-    let ctx = contexts.ctx_mut();
 
     bevy_inspector_egui::egui::Window::new("x")
         .title_bar(false)
@@ -136,18 +166,26 @@ fn show_gizmos(
 }
 
 fn spawn_environment(mut commands: Commands) {
-    let camera_transform = Transform::from_xyz(0., 540.*30., 720.*30.).looking_at(Vec3::new(0., 0., 267.), Vec3::Y);
-    let camera_rotation = camera_transform.rotation.to_euler(EulerRot::YXZ);
+    // let camera_transform = Transform::from_xyz(0., 540.*30., 720.*30.).looking_at(Vec3::new(0., 0., 267.), Vec3::Y);
+    // let camera_rotation = camera_transform.rotation.to_euler(EulerRot::YXZ);
 
-    commands.spawn((
-        Camera3dBundle::default(),
-        orbit_camera::OrbitCamera {
-            gimbal_x: -camera_rotation.0,
-            gimbal_y: -camera_rotation.1,
-            distance: camera_transform.translation.length(),
+    // commands.spawn((
+    //     Camera3dBundle::default(),
+    //     orbit_camera::OrbitCamera {
+    //         gimbal_x: -camera_rotation.0,
+    //         gimbal_y: -camera_rotation.1,
+    //         distance: camera_transform.translation.length(),
+    //         ..default()
+    //     },
+    // ));
+
+    commands.spawn(PanCamera2dBundle {
+        pan_camera: PanCamera {
+            zoom: 30.,
             ..default()
         },
-    ));
+        ..default()
+    });
 
     commands.spawn(DirectionalLightBundle {
         transform: Transform::from_rotation(Quat::from_rotation_x(-0.7)),
@@ -158,71 +196,6 @@ fn spawn_environment(mut commands: Commands) {
         },
         ..default()
     });
-}
-
-fn spawn_scene(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    map_file: Res<MapFile>,
-    mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    // let random_from_time = SystemTime::now()
-    //     .duration_since(SystemTime::UNIX_EPOCH)
-    //     .unwrap()
-    //     .as_millis() as u32;
-    // let hasher = PermutationTable::new(1);
-
-    // let mut buffer = vec![];
-    // let size = 1024;
-
-    // let mut min = f64::MAX;
-    // let mut max = f64::MIN;
-
-    // for i in 0..size {
-    //     for j in 0..size {
-    //         let x = i as f64 / size as f64 * 2. - 1.;
-    //         let y = j as f64 / size as f64 * 2. - 1.;
-
-    //         let color = open_simplex_2d(noise::Vector2::new(x * 10., y * 10.), &hasher);
-
-    //         min = min.min(color);
-    //         max = max.max(color);
-
-    //         let color = ((color / 1.2 + 0.5) * 256.) as u8;
-    //         // let color = 128;
-
-    //         buffer.push(color);
-    //         buffer.push(color);
-    //         buffer.push(color);
-    //         buffer.push(color);
-    //     }
-    // }
-    // dbg!(min, max);
-
-    // let image = images.add(Image::new(
-    //     Extent3d {
-    //         width: size,
-    //         height: size,
-    //         depth_or_array_layers: 1,
-    //     },
-    //     TextureDimension::D2,
-    //     buffer,
-    //     TextureFormat::Rgba8Unorm,
-    //     RenderAssetUsages::all(),
-    // ));
-
-    // commands.spawn(PbrBundle {
-    //     mesh: meshes.add(Plane3d::new(Vec3::Z).mesh().size(102400.0, 102400.0)),
-    //     material: materials.add(image),
-    //     ..default()
-    // });
-
-    // commands.spawn(SceneBundle {
-    //     scene: asset_server.load(format!("{}#Scene0", map_file.0)),
-    //     ..default()
-    // });
 }
 
 #[derive(Resource, Default)]
@@ -243,12 +216,10 @@ fn mouse_move(
     extras: Query<(Entity, &GltfExtras)>,
     parents: Query<&Parent>,
     children: Query<&Children>,
-    egui_ctx_query: Query<(), With<PrimaryWindow>>,
     mut egui_contexts: EguiContexts,
 ) {
-    if !egui_ctx_query.is_empty() && egui_contexts.ctx_mut().wants_pointer_input() {
-        return;
-    }
+    let Some(ctx) = egui_contexts.try_ctx_mut() else { return };
+    if ctx.wants_pointer_input() { return };
 
     if highlighted.last_time + Duration::from_millis(100) > time.elapsed() {
         return;
@@ -296,7 +267,7 @@ fn mouse_move(
                 highlighted.entities.push((child, handle.clone()));
 
                 let mut material = materials.get_mut(&*handle).expect("material not found").clone();
-                material.base_color = Color::DARK_GREEN;
+                material.base_color = DARK_GREEN.into();
                 *handle = materials.add(material);
             }
         }

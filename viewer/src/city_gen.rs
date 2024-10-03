@@ -66,7 +66,7 @@
 
 use std::collections::BinaryHeap;
 
-use bevy::{gizmos::gizmos::Gizmos, math::Vec2, render::color::Color};
+use bevy::{gizmos::gizmos::Gizmos, math::Vec2, color::palettes::css};
 use nanorand::Rng;
 use noise::core::open_simplex::open_simplex_2d;
 use petgraph::{graph::NodeIndex, Undirected};
@@ -101,6 +101,23 @@ pub struct RoadNetwork {
     pub tree: rstar::RTree<GeomWithData<[f32; 2], NodeIndex>>,
 }
 
+impl Default for RoadNetwork {
+    fn default() -> Self {
+        RoadNetwork {
+            graph: petgraph::Graph::new_undirected(),
+            tree: rstar::RTree::new(),
+        }
+    }
+}
+
+impl RoadNetwork {
+    fn add_node(&mut self, position: Vec2) -> NodeIndex {
+        let node = self.graph.add_node(NodeInfo { position, can_snap: true });
+        self.tree.insert(GeomWithData::new([position.x, position.y], node));
+        node
+    }
+}
+
 struct CheckTask {
     source: petgraph::graph::NodeIndex,
     target: Vec2,
@@ -131,12 +148,9 @@ impl Ord for CheckTask {
 pub fn generate_segments(segment_count_limit: usize) -> RoadNetwork {
     let mut rand = nanorand::WyRand::new_seed(1);
     let population = noise::permutationtable::PermutationTable::new(1);//rand.generate());
-    let mut graph = petgraph::Graph::new_undirected();
-    let mut tree = rstar::RTree::new();
+    let mut network = RoadNetwork::default();
 
-    let root_node = graph.add_node(NodeInfo { position: Vec2::new(0.0, 0.0), can_snap: true });
-    tree.insert(GeomWithData::new([0.0, 0.0], root_node));
-
+    let root_node = network.add_node(Vec2::new(0.0, 0.0));
     let mut queue = BinaryHeap::new();
 
     queue.push(CheckTask {
@@ -153,7 +167,7 @@ pub fn generate_segments(segment_count_limit: usize) -> RoadNetwork {
     });
 
     while let Some(mut task) = queue.pop() {
-        if graph.edge_count() > segment_count_limit {
+        if network.graph.edge_count() > segment_count_limit {
             break;
         }
 
@@ -161,10 +175,9 @@ pub fn generate_segments(segment_count_limit: usize) -> RoadNetwork {
         let old_target = task.target;
 
         if let Some((new_target, new_index)) = local_constraints_apply(
-            graph[task.source].position,
+            network.graph[task.source].position,
             task.target,
-            &graph,
-            &tree,
+            &network,
         ) {
             task.target = new_target;
             target_index = new_index;
@@ -173,17 +186,18 @@ pub fn generate_segments(segment_count_limit: usize) -> RoadNetwork {
         }
 
         let target_index = if let Some(target_index) = target_index {
-            if graph.find_edge(task.source, target_index).is_some() {
+            if network.graph.find_edge(task.source, target_index).is_some() {
                 continue;
             }
 
             target_index
         } else {
-            graph.add_node(NodeInfo { position: task.target, can_snap: true })
+            network.add_node(task.target)
+            // network.graph.add_node(NodeInfo { position: task.target, can_snap: true })
         };
 
-        tree.insert(GeomWithData::new([task.target.x, task.target.y], target_index));
-        graph.add_edge(task.source, target_index, task.way_type);
+        // network.tree.insert(GeomWithData::new([task.target.x, task.target.y], target_index));
+        network.graph.add_edge(task.source, target_index, task.way_type);
 
         // {
         //     graph[task.source].can_snap = true;
@@ -211,13 +225,13 @@ pub fn generate_segments(segment_count_limit: usize) -> RoadNetwork {
             continue;
         }
 
-        for mut new_task in global_goals_generate(&mut rand, &graph, &population, task.source, target_index) {
+        for mut new_task in global_goals_generate(&mut rand, &network.graph, &population, task.source, target_index) {
             new_task.priority += 1 + task.priority;
             queue.push(new_task);
         }
     }
 
-    RoadNetwork { graph, tree }
+    network
 }
 
 pub fn draw_segments(
@@ -226,7 +240,7 @@ pub fn draw_segments(
 ) {
     for node in network.graph.node_indices() {
         let position = network.graph[node].position;
-        let color = if network.graph[node].can_snap { Color::GREEN } else { Color::RED };
+        let color = if network.graph[node].can_snap { css::GREEN } else { css::RED };
         gizmos.circle_2d(position, 10., color);
         gizmos.circle_2d(position, 9., color);
         gizmos.circle_2d(position, 8., color);
@@ -238,8 +252,8 @@ pub fn draw_segments(
         let end = network.graph[end].position;
 
         match network.graph[edge] {
-            WayType::Highway => gizmos.line_2d(start, end, Color::YELLOW),
-            WayType::Normal => gizmos.line_2d(start, end, Color::GRAY),
+            WayType::Highway => gizmos.line_2d(start, end, css::YELLOW),
+            WayType::Normal => gizmos.line_2d(start, end, css::GRAY),
         }
     }
 }
@@ -247,8 +261,7 @@ pub fn draw_segments(
 pub fn local_constraints_apply(
     source: Vec2,
     target: Vec2,
-    graph: &petgraph::Graph<NodeInfo, WayType, Undirected>,
-    tree: &rstar::RTree<GeomWithData<[f32; 2], NodeIndex>>,
+    network: &RoadNetwork,
 ) -> Option<(Vec2, Option<NodeIndex>)> {
     let p1 = source;
     let p2 = target;
@@ -267,12 +280,12 @@ pub fn local_constraints_apply(
     let mut new_target = None;
     let mut new_target_dist = f32::MAX;
 
-    for point in tree.locate_in_envelope(&envelope) {
-        let node1_position = graph[point.data].position;
+    for point in network.tree.locate_in_envelope(&envelope) {
+        let node1_position = network.graph[point.data].position;
         if node1_position == p1 { continue; }
 
-        for other in graph.neighbors(point.data) {
-            let node2_position = graph[other].position;
+        for other in network.graph.neighbors(point.data) {
+            let node2_position = network.graph[other].position;
             if node2_position == p1 { continue; }
 
             let is = segment_intersection(p1, p2_extended, node1_position, node2_position);
@@ -291,6 +304,7 @@ pub fn local_constraints_apply(
     let p2 = if let Some((is, (node1_position, node2_position))) = new_target {
         let angle = (is - p1).angle_between(node2_position - node1_position).abs();
 
+        #[allow(clippy::manual_range_contains)]
         if angle < MINIMUM_INTERSECTION_DEVIATION || angle > std::f32::consts::PI - MINIMUM_INTERSECTION_DEVIATION {
             return None;
         }
@@ -307,8 +321,8 @@ pub fn local_constraints_apply(
     let mut new_target = None;
     let mut new_target_dist = f32::MAX;
 
-    for point in tree.locate_in_envelope(&envelope) {
-        if !graph[point.data].can_snap {
+    for point in network.tree.locate_in_envelope(&envelope) {
+        if !network.graph[point.data].can_snap {
             continue;
         }
 
@@ -316,7 +330,7 @@ pub fn local_constraints_apply(
             continue;
         }
 
-        let node1_position = graph[point.data].position;
+        let node1_position = network.graph[point.data].position;
 
         let dist = segment_point_distance_squared(p1, p2, node1_position);
         if dist <= MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
