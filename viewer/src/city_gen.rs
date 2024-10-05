@@ -67,9 +67,11 @@
 use std::collections::BinaryHeap;
 
 use bevy::{gizmos::gizmos::Gizmos, math::Vec2, color::palettes::css};
+use nalgebra::{Point2, Vector2};
 use nanorand::Rng;
 use noise::core::open_simplex::open_simplex_2d;
 use petgraph::{graph::NodeIndex, Undirected};
+use rapier2d::prelude::*;
 use rstar::primitives::GeomWithData;
 
 // const SEGMENT_COUNT_LIMIT: usize = 20;
@@ -85,8 +87,11 @@ const HIGHWAY_BRANCH_POPULATION_THRESHOLD: f32 = 0.;
 const NORMAL_BRANCH_TIME_DELAY_FROM_HIGHWAY: u32 = 5;
 const MAX_SNAP_DISTANCE: f32 = 50.;
 
+const RAPIER_GROUP_INTERSECTION_SNAP: Group = Group::GROUP_1;
+
 pub struct NodeInfo {
     pub position: Vec2,
+    pub snapping_collider: ColliderHandle,
     pub can_snap: bool,
 }
 
@@ -96,9 +101,32 @@ pub enum WayType {
     Normal,
 }
 
+enum ColliderUserData {
+    NodeIndex(NodeIndex),
+}
+
+impl From<u128> for ColliderUserData {
+    fn from(data: u128) -> Self {
+        ColliderUserData::NodeIndex(NodeIndex::new(data as usize))
+    }
+}
+
+impl From<ColliderUserData> for u128 {
+    fn from(data: ColliderUserData) -> Self {
+        match data {
+            ColliderUserData::NodeIndex(idx) => idx.index() as u128,
+        }
+    }
+}
+
 pub struct RoadNetwork {
     pub graph: petgraph::Graph<NodeInfo, WayType, Undirected>,
     pub tree: rstar::RTree<GeomWithData<[f32; 2], NodeIndex>>,
+    // rapier2d objects
+    query_pipeline: QueryPipeline,
+    rigid_bodies: RigidBodySet,
+    colliders: ColliderSet,
+    need_update: bool,
 }
 
 impl Default for RoadNetwork {
@@ -106,15 +134,92 @@ impl Default for RoadNetwork {
         RoadNetwork {
             graph: petgraph::Graph::new_undirected(),
             tree: rstar::RTree::new(),
+            query_pipeline: QueryPipeline::new(),
+            rigid_bodies: RigidBodySet::new(),
+            colliders: ColliderSet::new(),
+            need_update: false,
         }
     }
 }
 
 impl RoadNetwork {
     fn add_node(&mut self, position: Vec2) -> NodeIndex {
-        let node = self.graph.add_node(NodeInfo { position, can_snap: true });
+        let node = self.graph.add_node(NodeInfo { position, can_snap: true, snapping_collider: ColliderHandle::invalid() });
         self.tree.insert(GeomWithData::new([position.x, position.y], node));
+        let collider = self.colliders.insert(
+            ColliderBuilder::ball(MAX_SNAP_DISTANCE)
+                .translation(Vector2::new(position.x, position.y))
+                .collision_groups(InteractionGroups::new(RAPIER_GROUP_INTERSECTION_SNAP, Group::all()))
+                .user_data(ColliderUserData::NodeIndex(node).into())
+                .build()
+        );
+        self.graph[node].snapping_collider = collider;
+        self.need_update = true;
         node
+    }
+
+    // Cast a ray from a source node to target position,
+    //  - if the ray hits intersection collider (ball with radius=snap-distance), retarget to the intersection point
+    //  - if the ray hits network way (line segment), retarget to the intersection point
+    fn find_snapping(&mut self, source: NodeIndex, target: Vec2) -> Option<NodeIndex> {
+        // let pmin = source.min(target) - MAX_SNAP_DISTANCE * Vec2::ONE;
+        // let pmax = source.max(target) + MAX_SNAP_DISTANCE * Vec2::ONE;
+        // let envelope = rstar::AABB::from_corners(pmin.into(), pmax.into());
+
+        // let mut new_target = None;
+        // let mut new_target_dist = f32::MAX;
+
+        // for point in self.tree.locate_in_envelope(&envelope) {
+        //     if !self.graph[point.data].can_snap { continue }
+        //     if self.graph[point.data].position == source { continue }
+
+        //     let node1_position = self.graph[point.data].position;
+
+        //     let dist = segment_point_distance_squared(source, target, node1_position);
+        //     if dist <= MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
+        //         let dist = source.distance_squared(node1_position);
+        //         if dist < new_target_dist {
+        //             new_target = Some(point.data);
+        //             new_target_dist = dist;
+        //         }
+        //     }
+        // }
+
+        // new_target
+
+        self.update_pipeline();
+
+        let source_collider = self.graph[source].snapping_collider;
+        let source = self.graph[source].position;
+        let ray = Ray::new(
+            Point2::new(source.x, source.y),
+            Vector2::new(target.x - source.x, target.y - source.y).normalize(),
+        );
+        let filter = QueryFilter::default()
+            .exclude_collider(source_collider)
+            .groups(InteractionGroups::new(
+                RAPIER_GROUP_INTERSECTION_SNAP,
+                Group::all(),
+            ));
+
+        let (collider_handle, _) = self.query_pipeline.cast_ray(
+            &self.rigid_bodies,
+            &self.colliders,
+            &ray,
+            target.distance(source),
+            true,
+            filter,
+        )?;
+
+        let collider = self.colliders.get(collider_handle)?;
+        let ColliderUserData::NodeIndex(node_index) = collider.user_data.into();
+        Some(node_index)
+    }
+
+    fn update_pipeline(&mut self) {
+        if !self.need_update { return }
+        self.query_pipeline.update(&self.colliders);
+        self.need_update = false;
     }
 }
 
@@ -175,9 +280,10 @@ pub fn generate_segments(segment_count_limit: usize) -> RoadNetwork {
         let old_target = task.target;
 
         if let Some((new_target, new_index)) = local_constraints_apply(
+            task.source,
             network.graph[task.source].position,
             task.target,
-            &network,
+            &mut network,
         ) {
             task.target = new_target;
             target_index = new_index;
@@ -259,9 +365,10 @@ pub fn draw_segments(
 }
 
 pub fn local_constraints_apply(
+    source_index: NodeIndex,
     source: Vec2,
     target: Vec2,
-    network: &RoadNetwork,
+    network: &mut RoadNetwork,
 ) -> Option<(Vec2, Option<NodeIndex>)> {
     let p1 = source;
     let p2 = target;
@@ -276,72 +383,73 @@ pub fn local_constraints_apply(
     let pmin = p1.min(p2_extended) - HIGHWAY_SEGMENT_LENGTH * Vec2::ONE;
     let pmax = p1.max(p2_extended) + HIGHWAY_SEGMENT_LENGTH * Vec2::ONE;
 
-    let envelope = rstar::AABB::from_corners(pmin.into(), pmax.into());
-    let mut new_target = None;
-    let mut new_target_dist = f32::MAX;
+    // let envelope = rstar::AABB::from_corners(pmin.into(), pmax.into());
+    // let mut new_target = None;
+    // let mut new_target_dist = f32::MAX;
 
-    for point in network.tree.locate_in_envelope(&envelope) {
-        let node1_position = network.graph[point.data].position;
-        if node1_position == p1 { continue; }
+    // find existing segments intersecting with proposed segment,
+    // if one exist, shorten the current segment up to intersection point
+    // for point in network.tree.locate_in_envelope(&envelope) {
+    //     let node1_position = network.graph[point.data].position;
+    //     if node1_position == p1 { continue; }
 
-        for other in network.graph.neighbors(point.data) {
-            let node2_position = network.graph[other].position;
-            if node2_position == p1 { continue; }
+    //     for other in network.graph.neighbors(point.data) {
+    //         let node2_position = network.graph[other].position;
+    //         if node2_position == p1 { continue; }
 
-            let is = segment_intersection(p1, p2_extended, node1_position, node2_position);
+    //         let is = segment_intersection(p1, p2_extended, node1_position, node2_position);
 
-            if let Some(is) = is {
-                let dist = p1.distance_squared(is);
-                if new_target.is_none() || dist < new_target_dist {
-                    // dbg!("found better", is, dist);
-                    new_target = Some((is, (node1_position, node2_position)));
-                    new_target_dist = dist;
-                }
-            }
-        }
-    }
+    //         if let Some(is) = is {
+    //             let dist = p1.distance_squared(is);
+    //             if new_target.is_none() || dist < new_target_dist {
+    //                 // dbg!("found better", is, dist);
+    //                 new_target = Some((is, (node1_position, node2_position)));
+    //                 new_target_dist = dist;
+    //             }
+    //         }
+    //     }
+    // }
 
-    let p2 = if let Some((is, (node1_position, node2_position))) = new_target {
-        let angle = (is - p1).angle_between(node2_position - node1_position).abs();
+    // let p2 = if let Some((is, (node1_position, node2_position))) = new_target {
+    //     let angle = (is - p1).angle_between(node2_position - node1_position).abs();
 
-        #[allow(clippy::manual_range_contains)]
-        if angle < MINIMUM_INTERSECTION_DEVIATION || angle > std::f32::consts::PI - MINIMUM_INTERSECTION_DEVIATION {
-            return None;
-        }
+    //     // #[allow(clippy::manual_range_contains)]
+    //     // if angle < MINIMUM_INTERSECTION_DEVIATION || angle > std::f32::consts::PI - MINIMUM_INTERSECTION_DEVIATION {
+    //     //     return None;
+    //     // }
 
-        is
-    } else {
-        p2
-    };
+    //     is
+    // } else {
+    //     p2
+    // };
 
-    let pmin = p1.min(p2) - MAX_SNAP_DISTANCE * Vec2::ONE;
-    let pmax = p1.max(p2) + MAX_SNAP_DISTANCE * Vec2::ONE;
-    let envelope = rstar::AABB::from_corners(pmin.into(), pmax.into());
+    // let pmin = p1.min(p2) - MAX_SNAP_DISTANCE * Vec2::ONE;
+    // let pmax = p1.max(p2) + MAX_SNAP_DISTANCE * Vec2::ONE;
+    // let envelope = rstar::AABB::from_corners(pmin.into(), pmax.into());
 
-    let mut new_target = None;
-    let mut new_target_dist = f32::MAX;
+    // let mut new_target = None;
+    // let mut new_target_dist = f32::MAX;
 
-    for point in network.tree.locate_in_envelope(&envelope) {
-        if !network.graph[point.data].can_snap {
-            continue;
-        }
+    // find the closest node to the end of the segment,
+    // retarget if it is within snapping distance
+    // for point in network.tree.locate_in_envelope(&envelope) {
+    //     if !network.graph[point.data].can_snap { continue }
+    //     if *point.geom() == [p1.x, p1.y] { continue }
 
-        if *point.geom() == [p1.x, p1.y] {
-            continue;
-        }
+    //     let node1_position = network.graph[point.data].position;
 
-        let node1_position = network.graph[point.data].position;
-
-        let dist = segment_point_distance_squared(p1, p2, node1_position);
-        if dist <= MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
-            let dist = p1.distance_squared(node1_position);
-            if dist < new_target_dist {
-                // dbg!(("found snap", node1_position, dist));
-                new_target = Some((point.data, node1_position));
-                new_target_dist = dist;
-            }
-        }
-    }
+    //     let dist = segment_point_distance_squared(p1, p2, node1_position);
+    //     if dist <= MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
+    //         let dist = p1.distance_squared(node1_position);
+    //         if dist < new_target_dist {
+    //             // dbg!(("found snap", node1_position, dist));
+    //             new_target = Some((point.data, node1_position));
+    //             new_target_dist = dist;
+    //         }
+    //     }
+    // }
+    let new_target = network.find_snapping(source_index, p2)
+        .map(|idx| (idx, network.graph[idx].position));
 
     let p2 = new_target.map(|(_, pos)| pos).unwrap_or(p2);
     let node_index = new_target.map(|(idx, _)| idx);
@@ -454,6 +562,8 @@ pub fn sample_population(population: &noise::permutationtable::PermutationTable,
     open_simplex_2d(at.into(), population) as f32
 }
 
+// Calculate the intersection point of two line segments (p0, p1) and (p2, p3),
+// return intersection point if it exists, otherwise return None
 fn segment_intersection(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2) -> Option<Vec2> {
     // https://stackoverflow.com/questions/563198/how-do-you-detect-where-two-line-segments-intersect
     let s1 = p1 - p0;
@@ -469,6 +579,7 @@ fn segment_intersection(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2) -> Option<Vec2> 
     }
 }
 
+// Calculate the squared distance between a line segment (p1, p2) and a point (point)
 fn segment_point_distance_squared(p0: Vec2, p1: Vec2, point: Vec2) -> f32 {
     let l2 = (p0 - p1).length_squared();
     if l2 == 0. {

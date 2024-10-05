@@ -9,8 +9,9 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_inspector_egui::bevy_egui::EguiContexts;
 use bevy_mod_raycast::prelude::*;
-use city_gen::WayType;
-use pan_camera::{PanCamera, PanCamera2dBundle};
+
+use crate::city_gen::WayType;
+use crate::pan_camera::{PanCamera, PanCamera2dBundle};
 
 mod city_gen;
 mod pan_camera;
