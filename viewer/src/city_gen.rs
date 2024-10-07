@@ -66,32 +66,34 @@
 
 use std::collections::BinaryHeap;
 
-use bevy::{gizmos::gizmos::Gizmos, math::Vec2, color::palettes::css};
-use nalgebra::{Point2, Vector2};
+use bevy::{color::{palettes::css, Color}, gizmos::gizmos::Gizmos, math::{Rot2, Vec2, Vec2Swizzles}, utils::HashSet};
+use nalgebra::{Isometry2, Point2, Translation2, Vector2};
 use nanorand::Rng;
 use noise::core::open_simplex::open_simplex_2d;
-use petgraph::{graph::NodeIndex, Undirected};
-use rapier2d::prelude::*;
-use rstar::primitives::GeomWithData;
+use petgraph::{graph::{EdgeIndex, NodeIndex}, visit::EdgeRef, Undirected};
+use rapier2d::{parry::query::ShapeCastOptions, prelude::*};
+// use rstar::primitives::GeomWithData;
 
 // const SEGMENT_COUNT_LIMIT: usize = 20;
 const BRANCH_ANGLE_DEVIATION: f32 = 3.0f32 * std::f32::consts::PI / 180.0f32;
 const STRAIGHT_ANGLE_DEVIATION: f32 = 15.0f32 * std::f32::consts::PI / 180.0f32;
-const MINIMUM_INTERSECTION_DEVIATION: f32 = 30.0f32 * std::f32::consts::PI / 180.0f32;
-const NORMAL_SEGMENT_LENGTH: f32 = 300.;
-const HIGHWAY_SEGMENT_LENGTH: f32 = 400.;
+const MINIMUM_INTERSECTION_DEVIATION: f32 = 40.0f32 * std::f32::consts::PI / 180.0f32;
+const NORMAL_SEGMENT_LENGTH: f32 = 100.; // 300
+const HIGHWAY_SEGMENT_LENGTH: f32 = 150.; // 400
 const NORMAL_BRANCH_PROBABILITY: f32 = 0.4;
 const HIGHWAY_BRANCH_PROBABILITY: f32 = 0.05;
 const NORMAL_BRANCH_POPULATION_THRESHOLD: f32 = 0.;
 const HIGHWAY_BRANCH_POPULATION_THRESHOLD: f32 = 0.;
 const NORMAL_BRANCH_TIME_DELAY_FROM_HIGHWAY: u32 = 5;
-const MAX_SNAP_DISTANCE: f32 = 50.;
+const MAX_SNAP_DISTANCE: f32 = 30.; // 50
 
-const RAPIER_GROUP_INTERSECTION_SNAP: Group = Group::GROUP_1;
+pub const RAPIER_GROUP_INTERSECTION_SNAP: Group = Group::GROUP_1;
+pub const RAPIER_GROUP_WAY_CENTERLINE: Group = Group::GROUP_2;
+pub const RAPIER_GROUP_BUILDING: Group = Group::GROUP_3;
 
 pub struct NodeInfo {
     pub position: Vec2,
-    pub snapping_collider: ColliderHandle,
+    // pub snapping_collider: ColliderHandle,
     pub can_snap: bool,
 }
 
@@ -101,51 +103,68 @@ pub enum WayType {
     Normal,
 }
 
+pub struct BuildingInfo {
+    pub position: Vec2,
+    pub orientation: Rot2,
+    pub size: Vec2,
+    pub color: Color,
+    // pub way: EdgeIndex,
+}
+
 enum ColliderUserData {
     NodeIndex(NodeIndex),
+    EdgeIndex(EdgeIndex),
 }
 
 impl From<u128> for ColliderUserData {
     fn from(data: u128) -> Self {
-        ColliderUserData::NodeIndex(NodeIndex::new(data as usize))
+        let (high, low) = ((data >> 64) as u64, data as u64);
+        match high {
+            1 => ColliderUserData::NodeIndex(NodeIndex::new(low as usize)),
+            2 => ColliderUserData::EdgeIndex(EdgeIndex::new(low as usize)),
+            _ => panic!("Invalid collider user data"),
+        }
     }
 }
 
 impl From<ColliderUserData> for u128 {
     fn from(data: ColliderUserData) -> Self {
         match data {
-            ColliderUserData::NodeIndex(idx) => idx.index() as u128,
+            ColliderUserData::NodeIndex(node) => (1 << 64) | node.index() as u128,
+            ColliderUserData::EdgeIndex(edge) => (2 << 64) | edge.index() as u128,
         }
     }
 }
 
 pub struct RoadNetwork {
     pub graph: petgraph::Graph<NodeInfo, WayType, Undirected>,
-    pub tree: rstar::RTree<GeomWithData<[f32; 2], NodeIndex>>,
+    pub buildings: Vec<BuildingInfo>,
+    // pub tree: rstar::RTree<GeomWithData<[f32; 2], NodeIndex>>,
     // rapier2d objects
     query_pipeline: QueryPipeline,
     rigid_bodies: RigidBodySet,
     colliders: ColliderSet,
-    need_update: bool,
+    modified_colliders: Vec<ColliderHandle>,
 }
 
 impl Default for RoadNetwork {
     fn default() -> Self {
         RoadNetwork {
             graph: petgraph::Graph::new_undirected(),
-            tree: rstar::RTree::new(),
+            buildings: Vec::new(),
+            // tree: rstar::RTree::new(),
             query_pipeline: QueryPipeline::new(),
             rigid_bodies: RigidBodySet::new(),
             colliders: ColliderSet::new(),
-            need_update: false,
+            modified_colliders: Vec::new(),
         }
     }
 }
 
 impl RoadNetwork {
-    fn add_node(&mut self, position: Vec2) -> NodeIndex {
-        let node = self.graph.add_node(NodeInfo { position, can_snap: true, snapping_collider: ColliderHandle::invalid() });
-        self.tree.insert(GeomWithData::new([position.x, position.y], node));
+    pub fn add_node(&mut self, position: Vec2) -> NodeIndex {
+        let node = self.graph.add_node(NodeInfo { position, can_snap: true });
+        // self.tree.insert(GeomWithData::new([position.x, position.y], node));
         let collider = self.colliders.insert(
             ColliderBuilder::ball(MAX_SNAP_DISTANCE)
                 .translation(Vector2::new(position.x, position.y))
@@ -153,73 +172,189 @@ impl RoadNetwork {
                 .user_data(ColliderUserData::NodeIndex(node).into())
                 .build()
         );
-        self.graph[node].snapping_collider = collider;
-        self.need_update = true;
+        self.modified_colliders.push(collider);
         node
+    }
+
+    pub fn add_way(&mut self, start: NodeIndex, end: NodeIndex, way_type: WayType) {
+        let edge_index = self.graph.add_edge(start, end, way_type);
+        let start_pos = self.graph[start].position;
+        let end_pos = self.graph[end].position;
+        let collider = self.colliders.insert(
+            ColliderBuilder::segment(Point2::new(start_pos.x, start_pos.y), Point2::new(end_pos.x, end_pos.y))
+                .collision_groups(InteractionGroups::new(RAPIER_GROUP_WAY_CENTERLINE, Group::all()))
+                .user_data(ColliderUserData::EdgeIndex(edge_index).into())
+                .build()
+        );
+        self.modified_colliders.push(collider);
+    }
+
+    pub fn add_building(&mut self, building: BuildingInfo) {
+        let collider = self.colliders.insert(
+            ColliderBuilder::cuboid(building.size.x / 2., building.size.y / 2.)
+                .translation(Vector2::new(building.position.x, building.position.y))
+                .rotation(building.orientation.as_radians())
+                .collision_groups(InteractionGroups::new(RAPIER_GROUP_BUILDING, Group::all()))
+                .build()
+        );
+        self.buildings.push(building);
+        self.modified_colliders.push(collider);
     }
 
     // Cast a ray from a source node to target position,
     //  - if the ray hits intersection collider (ball with radius=snap-distance), retarget to the intersection point
     //  - if the ray hits network way (line segment), retarget to the intersection point
-    fn find_snapping(&mut self, source: NodeIndex, target: Vec2) -> Option<NodeIndex> {
-        // let pmin = source.min(target) - MAX_SNAP_DISTANCE * Vec2::ONE;
-        // let pmax = source.max(target) + MAX_SNAP_DISTANCE * Vec2::ONE;
-        // let envelope = rstar::AABB::from_corners(pmin.into(), pmax.into());
-
-        // let mut new_target = None;
-        // let mut new_target_dist = f32::MAX;
-
-        // for point in self.tree.locate_in_envelope(&envelope) {
-        //     if !self.graph[point.data].can_snap { continue }
-        //     if self.graph[point.data].position == source { continue }
-
-        //     let node1_position = self.graph[point.data].position;
-
-        //     let dist = segment_point_distance_squared(source, target, node1_position);
-        //     if dist <= MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
-        //         let dist = source.distance_squared(node1_position);
-        //         if dist < new_target_dist {
-        //             new_target = Some(point.data);
-        //             new_target_dist = dist;
-        //         }
-        //     }
-        // }
-
-        // new_target
-
+    fn find_snapping(&mut self, source: NodeIndex, target: Vec2) -> Option<(Vec2, Option<NodeIndex>)> {
         self.update_pipeline();
 
-        let source_collider = self.graph[source].snapping_collider;
-        let source = self.graph[source].position;
+        // let source_collider = self.graph[source].snapping_collider;
+        let source_pos = self.graph[source].position;
         let ray = Ray::new(
-            Point2::new(source.x, source.y),
-            Vector2::new(target.x - source.x, target.y - source.y).normalize(),
+            Point2::new(source_pos.x, source_pos.y),
+            Vector2::new(target.x - source_pos.x, target.y - source_pos.y).normalize(),
         );
-        let filter = QueryFilter::default()
-            .exclude_collider(source_collider)
-            .groups(InteractionGroups::new(
-                RAPIER_GROUP_INTERSECTION_SNAP,
-                Group::all(),
-            ));
+        let predicate = |_handle: ColliderHandle, collider: &Collider| {
+            // ignore node we are coming from
+            // if handle == source_collider { return false; }
+            if let ColliderUserData::NodeIndex(node_index) = ColliderUserData::from(collider.user_data) {
+                if node_index == source {
+                    return false;
+                }
+            }
 
-        let (collider_handle, _) = self.query_pipeline.cast_ray(
+            // ignore existing ways coming from the same source node
+            if let ColliderUserData::EdgeIndex(edge_index) = ColliderUserData::from(collider.user_data) {
+                let (start, end) = self.graph.edge_endpoints(edge_index).unwrap();
+                if start == source || end == source {
+                    return false;
+                }
+            }
+
+            true
+        };
+        let filter = QueryFilter::default()
+            // .exclude_collider(source_collider)
+            // .groups(InteractionGroups::new(
+            //     RAPIER_GROUP_INTERSECTION_SNAP,
+            //     Group::all(),
+            // ))
+            .predicate(&predicate);
+
+        let Some((collider_handle, toi)) = self.query_pipeline.cast_ray(
             &self.rigid_bodies,
             &self.colliders,
             &ray,
-            target.distance(source),
+            target.distance(source_pos),
             true,
             filter,
-        )?;
+        ) else {
+            return Some((target, None));
+        };
 
         let collider = self.colliders.get(collider_handle)?;
-        let ColliderUserData::NodeIndex(node_index) = collider.user_data.into();
-        Some(node_index)
+        match ColliderUserData::from(collider.user_data) {
+            ColliderUserData::NodeIndex(node_index) => {
+                let node = self.graph.node_weight(node_index)?;
+                let new_target = node.position;
+
+                // calculate minimum angle between this edge and all other edges connected to the node
+                for edge_index in self.graph.edges(node_index) {
+                    let (source, target) = self.graph.edge_endpoints(edge_index.id())?;
+                    let start = self.graph[source].position;
+                    let end = self.graph[target].position;
+                    let new_dot = ((end - start).normalize_or_zero().dot((new_target - source_pos).normalize_or_zero())).abs();
+                    if new_dot < MINIMUM_INTERSECTION_DEVIATION.sin() {
+                        return None;
+                    }
+                }
+
+                Some((new_target, Some(node_index)))
+            }
+            ColliderUserData::EdgeIndex(edge_index) => {
+                // let (source, target) = self.graph.edge_endpoints(edge_index)?;
+                // let start = self.graph[source].position;
+                // let end = self.graph[target].position;
+                // let intersection = segment_intersection(start, end, source, target)?;
+                let intersection = Point2::new(source_pos.x, source_pos.y) + ray.dir * toi;
+                let new_target = Vec2::new(intersection.x, intersection.y);
+
+                // calculate minimum angle between this edge and existing edge
+                let (source, target) = self.graph.edge_endpoints(edge_index)?;
+                let start = self.graph[source].position;
+                let end = self.graph[target].position;
+                let new_dot = ((end - start).normalize_or_zero().dot((new_target - source_pos).normalize_or_zero())).abs();
+
+                if new_dot < MINIMUM_INTERSECTION_DEVIATION.sin() {
+                    return None;
+                }
+
+                Some((new_target, None))
+            }
+        }
+    }
+
+    pub fn calculate_placement(
+        &mut self,
+        mut shape_pos: Isometry2<f32>,
+        shape: &dyn Shape,
+        filter: QueryFilter,
+        along_line: Option<Vector2<f32>>,
+    ) -> Option<Translation2<f32>> {
+        self.update_pipeline();
+
+        let along_line = along_line.and_then(|v| v.try_normalize(1e-10));
+        let mut intersections = HashSet::new();
+        self.query_pipeline.intersections_with_shape(&self.rigid_bodies, &self.colliders, &shape_pos, shape, filter, |handle| {
+            intersections.insert(handle);
+            true
+        });
+        if intersections.is_empty() {
+            return Some(shape_pos.translation);
+        }
+
+        let center = shape_pos.translation.transform_point(&Point2::origin());
+        let (_collider, projection) = self.query_pipeline.project_point(&self.rigid_bodies, &self.colliders, &center, false, filter)?;
+        let contact = projection.point;
+        let mut shape_vel: Vector2<f32> = (if projection.is_inside { center - contact } else { contact - center }).try_normalize(1e-10)?;
+
+        if let Some(along_line) = along_line {
+            if shape_vel.dot(&along_line) < 0. {
+                shape_vel = -along_line;
+            } else {
+                shape_vel = along_line;
+            }
+        }
+
+        shape_pos.translation.vector -= shape_vel * 1000.;
+
+        let (_collider, hit) = self.query_pipeline.cast_shape(
+            &self.rigid_bodies,
+            &self.colliders,
+            &shape_pos,
+            &shape_vel,
+            shape,
+            ShapeCastOptions::default(),
+            QueryFilter::default().predicate(&|handle, _| intersections.contains(&handle)),
+        )?;
+        shape_pos.translation.vector += shape_vel * hit.time_of_impact - shape_vel * 0.1;
+
+        if self.query_pipeline.intersection_with_shape(
+            &self.rigid_bodies,
+            &self.colliders,
+            &shape_pos,
+            shape,
+            filter,
+        ).is_some() {
+            return None;
+        }
+
+        Some(shape_pos.translation)
     }
 
     fn update_pipeline(&mut self) {
-        if !self.need_update { return }
-        self.query_pipeline.update(&self.colliders);
-        self.need_update = false;
+        let modified_colliders = std::mem::take(&mut self.modified_colliders);
+        if modified_colliders.is_empty() { return; }
+        self.query_pipeline.update_incremental(&self.colliders, &modified_colliders, &[], true);
     }
 }
 
@@ -303,7 +438,8 @@ pub fn generate_segments(segment_count_limit: usize) -> RoadNetwork {
         };
 
         // network.tree.insert(GeomWithData::new([task.target.x, task.target.y], target_index));
-        network.graph.add_edge(task.source, target_index, task.way_type);
+        //network.graph.add_edge(task.source, target_index, task.way_type);
+        network.add_way(task.source, target_index, task.way_type);
 
         // {
         //     graph[task.source].can_snap = true;
@@ -337,6 +473,76 @@ pub fn generate_segments(segment_count_limit: usize) -> RoadNetwork {
         }
     }
 
+    let mut rand = nanorand::WyRand::new_seed(1);
+    let edge_indices = network.graph.edge_indices().collect::<Vec<_>>();
+
+    for edge_index in edge_indices {
+        for _ in 0..100 {
+            let (node1, node2) = network.graph.edge_endpoints(edge_index).unwrap();
+            let mut node1 = &network.graph[node1];
+            let mut node2 = &network.graph[node2];
+
+            if rand.generate::<bool>() {
+                (node1, node2) = (node2, node1);
+            }
+
+            let size = match rand.generate::<f32>() {
+                0.0..0.2 => Vec2::new(35.438, 12.4346),
+                0.2..0.4 => Vec2::new(37.788, 9.65812),
+                0.4..0.7 => Vec2::new(23.2295, 16.0061),
+                0.7..1.0 => Vec2::new(23.2295, 16.0061),
+                _ => unreachable!(),
+            };
+            let size = size.yx(); // TODO: wrong orientation
+
+            let t = rand.generate::<f32>();
+            let position = node1.position + (node2.position - node1.position) * t;
+            let offset = (node2.position - node1.position).normalize_or_zero().perp() * (size.y / 2. + 5.);
+            let position = position - offset;
+            let angle = (node1.position - node2.position).to_angle();
+            let node1_position = node1.position;
+            let node2_position = node2.position;
+
+            // debug
+            // network.buildings.push(BuildingInfo {
+            //     position,
+            //     orientation: angle.into(),
+            //     size,
+            //     color: css::BLUE.into(),
+            // });
+
+            let shape_pos = Isometry2::new(Vector2::new(position.x, position.y), angle);
+            let shape = rapier2d::parry::shape::Cuboid::new(Vector2::new(size.x / 2., size.y / 2.));
+            let place_along_line = Vector2::new(node1.position.x - node2.position.x, node1.position.y - node2.position.y);
+            network.update_pipeline();
+
+            let filter = QueryFilter::default()
+                .groups(InteractionGroups::new(Group::all(), RAPIER_GROUP_WAY_CENTERLINE | RAPIER_GROUP_BUILDING));
+            let placement = network.calculate_placement(shape_pos, &shape, filter, Some(place_along_line));
+            let mut placed = false;
+
+            if let Some(placement) = placement {
+                let position = Vec2::new(placement.x, placement.y);
+                // inverse-lerp to calculate new t, make sure it's still inside segment
+                let new_t = (position - node1_position).dot(node2_position - node1_position) / (node2_position - node1_position).length_squared();
+
+                if (0.0..=1.0).contains(&new_t) {
+                    network.add_building(BuildingInfo {
+                        position,
+                        orientation: angle.into(),
+                        size,
+                        color: css::DARK_MAGENTA.into(),
+                    });
+                    placed = true;
+                }
+            }
+
+            if !placed {
+                break;
+            }
+        }
+    }
+
     network
 }
 
@@ -347,8 +553,8 @@ pub fn draw_segments(
     for node in network.graph.node_indices() {
         let position = network.graph[node].position;
         let color = if network.graph[node].can_snap { css::GREEN } else { css::RED };
-        gizmos.circle_2d(position, 10., color);
-        gizmos.circle_2d(position, 9., color);
+        // gizmos.circle_2d(position, 10., color);
+        // gizmos.circle_2d(position, 9., color);
         gizmos.circle_2d(position, 8., color);
     }
 
@@ -362,6 +568,15 @@ pub fn draw_segments(
             WayType::Normal => gizmos.line_2d(start, end, css::GRAY),
         }
     }
+
+    for building in network.buildings.iter() {
+        gizmos.rect_2d(building.position, building.orientation, building.size, building.color);
+        gizmos.line_2d(building.position, building.position + (Vec2::X * 20.).rotate((building.orientation.inverse()).sin_cos().into()), css::DARK_BLUE);
+        // gizmos.circle_2d(building.position, 20., css::GOLD);
+        // gizmos.circle_2d(building.position, 19., css::GOLD);
+        // gizmos.circle_2d(building.position, 18., css::GOLD);
+        // gizmos.circle_2d(building.position, 17., css::GOLD);
+    }
 }
 
 pub fn local_constraints_apply(
@@ -370,18 +585,18 @@ pub fn local_constraints_apply(
     target: Vec2,
     network: &mut RoadNetwork,
 ) -> Option<(Vec2, Option<NodeIndex>)> {
-    let p1 = source;
-    let p2 = target;
+    // let p1 = source;
+    // let p2 = target;
     // dbg!("-----------------------");
     // dbg!(("start with", p1, p2));
 
-    if p1.distance_squared(p2) <= MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
-        return None;
-    }
+    // if p1.distance_squared(p2) <= MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
+    //     return None;
+    // }
 
-    let p2_extended = p2 + (p2 - p1).normalize_or_zero() * MAX_SNAP_DISTANCE;
-    let pmin = p1.min(p2_extended) - HIGHWAY_SEGMENT_LENGTH * Vec2::ONE;
-    let pmax = p1.max(p2_extended) + HIGHWAY_SEGMENT_LENGTH * Vec2::ONE;
+    // let p2_extended = p2 + (p2 - p1).normalize_or_zero() * MAX_SNAP_DISTANCE;
+    // let pmin = p1.min(p2_extended) - HIGHWAY_SEGMENT_LENGTH * Vec2::ONE;
+    // let pmax = p1.max(p2_extended) + HIGHWAY_SEGMENT_LENGTH * Vec2::ONE;
 
     // let envelope = rstar::AABB::from_corners(pmin.into(), pmax.into());
     // let mut new_target = None;
@@ -448,17 +663,14 @@ pub fn local_constraints_apply(
     //         }
     //     }
     // }
-    let new_target = network.find_snapping(source_index, p2)
-        .map(|idx| (idx, network.graph[idx].position));
+    network.find_snapping(source_index, target)
+    // ;
 
-    let p2 = new_target.map(|(_, pos)| pos).unwrap_or(p2);
-    let node_index = new_target.map(|(idx, _)| idx);
-
-    if p2.distance_squared(p1) > MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
-        Some((p2, node_index))
-    } else {
-        None
-    }
+    // if p2.distance_squared(p1) > MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
+    //     Some((p2, node_index))
+    // } else {
+    //     None
+    // }
 }
 
 fn global_goals_generate(
@@ -560,32 +772,4 @@ fn global_goals_generate(
 pub fn sample_population(population: &noise::permutationtable::PermutationTable, at: Vec2) -> f32 {
     let at: [f64; 2] = (at.as_dvec2() / 102400. * 15.).into();
     open_simplex_2d(at.into(), population) as f32
-}
-
-// Calculate the intersection point of two line segments (p0, p1) and (p2, p3),
-// return intersection point if it exists, otherwise return None
-fn segment_intersection(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2) -> Option<Vec2> {
-    // https://stackoverflow.com/questions/563198/how-do-you-detect-where-two-line-segments-intersect
-    let s1 = p1 - p0;
-    let s2 = p3 - p2;
-
-    let s = (-s1.y * (p0.x - p2.x) + s1.x * (p0.y - p2.y)) / (-s2.x * s1.y + s1.x * s2.y);
-    let t = ( s2.x * (p0.y - p2.y) - s2.y * (p0.x - p2.x)) / (-s2.x * s1.y + s1.x * s2.y);
-
-    if (0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&t) {
-        Some(Vec2::new(p0.x + (t * s1.x), p0.y + (t * s1.y)))
-    } else {
-        None
-    }
-}
-
-// Calculate the squared distance between a line segment (p1, p2) and a point (point)
-fn segment_point_distance_squared(p0: Vec2, p1: Vec2, point: Vec2) -> f32 {
-    let l2 = (p0 - p1).length_squared();
-    if l2 == 0. {
-        return (point - p0).length_squared();
-    }
-
-    let t = ((point - p0).dot(p1 - p0) / l2).clamp(0., 1.);
-    (point - (p0 + t * (p1 - p0))).length_squared()
 }
