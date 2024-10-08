@@ -64,7 +64,7 @@
 //     }
 // }
 
-use std::collections::BinaryHeap;
+use std::{collections::BinaryHeap, time::{Duration, Instant}};
 
 use bevy::{color::{palettes::css, Color}, gizmos::gizmos::Gizmos, math::{Rot2, Vec2, Vec2Swizzles}, utils::HashSet};
 use nalgebra::{Isometry2, Point2, Translation2, Vector2};
@@ -75,17 +75,58 @@ use rapier2d::{parry::query::ShapeCastOptions, prelude::*};
 // use rstar::primitives::GeomWithData;
 
 // const SEGMENT_COUNT_LIMIT: usize = 20;
-const BRANCH_ANGLE_DEVIATION: f32 = 3.0f32 * std::f32::consts::PI / 180.0f32;
-const STRAIGHT_ANGLE_DEVIATION: f32 = 15.0f32 * std::f32::consts::PI / 180.0f32;
-const MINIMUM_INTERSECTION_DEVIATION: f32 = 40.0f32 * std::f32::consts::PI / 180.0f32;
-const NORMAL_SEGMENT_LENGTH: f32 = 100.; // 300
-const HIGHWAY_SEGMENT_LENGTH: f32 = 150.; // 400
-const NORMAL_BRANCH_PROBABILITY: f32 = 0.4;
-const HIGHWAY_BRANCH_PROBABILITY: f32 = 0.05;
-const NORMAL_BRANCH_POPULATION_THRESHOLD: f32 = 0.;
-const HIGHWAY_BRANCH_POPULATION_THRESHOLD: f32 = 0.;
-const NORMAL_BRANCH_TIME_DELAY_FROM_HIGHWAY: u32 = 5;
-const MAX_SNAP_DISTANCE: f32 = 30.; // 50
+// const BRANCH_ANGLE_DEVIATION: f32 = 3.0f32 * std::f32::consts::PI / 180.0f32;
+// const STRAIGHT_ANGLE_DEVIATION: f32 = 15.0f32 * std::f32::consts::PI / 180.0f32;
+// const MINIMUM_INTERSECTION_DEVIATION: f32 = 40.0f32 * std::f32::consts::PI / 180.0f32;
+// const NORMAL_SEGMENT_LENGTH: f32 = 100.; // 300
+// const HIGHWAY_SEGMENT_LENGTH: f32 = 150.; // 400
+// const NORMAL_BRANCH_PROBABILITY: f32 = 0.4;
+// const HIGHWAY_BRANCH_PROBABILITY: f32 = 0.05;
+// const NORMAL_BRANCH_POPULATION_THRESHOLD: f32 = 0.;
+// const HIGHWAY_BRANCH_POPULATION_THRESHOLD: f32 = 0.;
+// const NORMAL_BRANCH_TIME_DELAY_FROM_HIGHWAY: u32 = 5;
+// const MAX_SNAP_DISTANCE: f32 = 30.; // 50
+
+#[derive(Debug, Clone)]
+pub struct GeneratorConfig {
+    pub seed: u32,
+    pub segment_count_limit: usize,
+    pub branch_angle_deviation: f32,
+    pub straight_angle_deviation: f32,
+    pub minimum_intersection_deviation: f32,
+    pub normal_segment_length: f32,
+    pub highway_segment_length: f32,
+    pub normal_branch_probability: f32,
+    pub highway_branch_probability: f32,
+    pub normal_branch_population_threshold: f32,
+    pub highway_branch_population_threshold: f32,
+    pub normal_branch_time_delay_from_highway: u32,
+    pub max_snap_distance: f32,
+    pub generate_buildings: bool,
+    pub generate_trees: bool,
+}
+
+impl Default for GeneratorConfig {
+    fn default() -> Self {
+        GeneratorConfig {
+            seed: 1,
+            segment_count_limit: 20,
+            branch_angle_deviation: 3.0f32.to_radians(),
+            straight_angle_deviation: 15.0f32.to_radians(),
+            minimum_intersection_deviation: 40.0f32.to_radians(),
+            normal_segment_length: 100., // 300
+            highway_segment_length: 150., // 400
+            normal_branch_probability: 0.4,
+            highway_branch_probability: 0.05,
+            normal_branch_population_threshold: 0.,
+            highway_branch_population_threshold: 0.,
+            normal_branch_time_delay_from_highway: 5,
+            max_snap_distance: 30., // 50
+            generate_buildings: true,
+            generate_trees: true,
+        }
+    }
+}
 
 pub const RAPIER_GROUP_INTERSECTION_SNAP: Group = Group::GROUP_1;
 pub const RAPIER_GROUP_WAY_CENTERLINE: Group = Group::GROUP_2;
@@ -108,7 +149,15 @@ pub struct BuildingInfo {
     pub orientation: Rot2,
     pub size: Vec2,
     pub color: Color,
-    // pub way: EdgeIndex,
+    pub mesh: String,
+    pub offset_from_way: f32,
+}
+
+pub struct ObjectInfo {
+    pub position: Vec2,
+    pub orientation: Rot2,
+    pub size: f32,
+    pub mesh: String,
 }
 
 enum ColliderUserData {
@@ -136,37 +185,418 @@ impl From<ColliderUserData> for u128 {
     }
 }
 
+#[derive(Default)]
+enum GeneratorState {
+    NetworkInit,
+    Network {
+        rand: nanorand::WyRand,
+        population: Box<noise::permutationtable::PermutationTable>,
+        queue: BinaryHeap<CheckTask>,
+    },
+    BuildingsInit,
+    Buildings {
+        rand: nanorand::WyRand,
+        edge_indices: Vec<EdgeIndex>,
+    },
+    ObjectsInit,
+    Objects {
+        rand: nanorand::WyRand,
+        edge_indices: Vec<EdgeIndex>,
+    },
+    #[default]
+    Done,
+}
+
 pub struct RoadNetwork {
+    config: GeneratorConfig,
     pub graph: petgraph::Graph<NodeInfo, WayType, Undirected>,
     pub buildings: Vec<BuildingInfo>,
+    pub objects: Vec<ObjectInfo>,
     // pub tree: rstar::RTree<GeomWithData<[f32; 2], NodeIndex>>,
     // rapier2d objects
     query_pipeline: QueryPipeline,
     rigid_bodies: RigidBodySet,
     colliders: ColliderSet,
     modified_colliders: Vec<ColliderHandle>,
+    generator_state: GeneratorState,
 }
 
 impl Default for RoadNetwork {
     fn default() -> Self {
         RoadNetwork {
+            config: GeneratorConfig::default(),
             graph: petgraph::Graph::new_undirected(),
             buildings: Vec::new(),
+            objects: Vec::new(),
             // tree: rstar::RTree::new(),
             query_pipeline: QueryPipeline::new(),
             rigid_bodies: RigidBodySet::new(),
             colliders: ColliderSet::new(),
             modified_colliders: Vec::new(),
+            generator_state: GeneratorState::NetworkInit,
         }
     }
 }
 
 impl RoadNetwork {
+    pub fn new(config: GeneratorConfig) -> Self {
+        RoadNetwork {
+            config,
+            ..Default::default()
+        }
+    }
+
+    pub fn is_generating(&self) -> bool {
+        #[allow(clippy::match_like_matches_macro)]
+        match self.generator_state {
+            GeneratorState::Done => false,
+            _ => true,
+        }
+    }
+
+    pub fn stop_generating(&mut self) {
+        self.generator_state = GeneratorState::Done;
+    }
+
+    pub fn generate(&mut self, timeout: Duration) {
+        let now = Instant::now();
+        let max_time = now + timeout;
+
+        while Instant::now() < max_time {
+            match &self.generator_state {
+                GeneratorState::NetworkInit => {
+                    self.generate_network_init();
+                }
+                GeneratorState::Network { .. } => {
+                    self.generate_network(max_time);
+                }
+                GeneratorState::BuildingsInit => {
+                    self.generate_buildings_init();
+                }
+                GeneratorState::Buildings { .. } => {
+                    self.generate_buildings(max_time);
+                }
+                GeneratorState::ObjectsInit => {
+                    self.generate_objects_init();
+                }
+                GeneratorState::Objects { .. } => {
+                    self.generate_objects(max_time);
+                }
+                GeneratorState::Done => {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn generate_network_init(&mut self) {
+        let root_node = self.add_node(Vec2::new(0.0, 0.0));
+        let mut queue = BinaryHeap::new();
+
+        queue.push(CheckTask {
+            source: root_node,
+            target: Vec2::new(self.config.highway_segment_length, 0.),
+            way_type: WayType::Highway,
+            priority: 0,
+        });
+        queue.push(CheckTask {
+            source: root_node,
+            target: Vec2::new(-self.config.highway_segment_length, 0.),
+            way_type: WayType::Highway,
+            priority: 0,
+        });
+
+        self.generator_state = GeneratorState::Network {
+            rand: nanorand::WyRand::new_seed(self.config.seed as u64),
+            population: Box::new(noise::permutationtable::PermutationTable::new(self.config.seed)),
+            queue,
+        };
+    }
+
+    fn generate_network(&mut self, until: Instant) {
+        let GeneratorState::Network { mut rand, population, mut queue } = std::mem::take(&mut self.generator_state) else {
+            unreachable!();
+        };
+
+        loop {
+            if self.graph.edge_count() & 0x7 == 0 && Instant::now() >= until {
+                self.generator_state = GeneratorState::Network { rand, population, queue };
+                return;
+            }
+
+            let Some(mut task) = queue.pop() else {
+                break;
+            };
+
+            if self.graph.edge_count() > self.config.segment_count_limit {
+                break;
+            }
+
+            let target_index;
+            let old_target = task.target;
+
+            if let Some((new_target, new_index)) = local_constraints_apply(
+                task.source,
+                self.graph[task.source].position,
+                task.target,
+                self,
+            ) {
+                task.target = new_target;
+                target_index = new_index;
+            } else {
+                continue;
+            }
+
+            let target_index = if let Some(target_index) = target_index {
+                if self.graph.find_edge(task.source, target_index).is_some() {
+                    continue;
+                }
+
+                target_index
+            } else {
+                self.add_node(task.target)
+            };
+
+            self.add_way(task.source, target_index, task.way_type);
+
+            // {
+            //     graph[task.source].can_snap = true;
+
+            //     let mut iter = graph.edges(task.source).fuse();
+            //     let e1 = iter.next();
+            //     let e2 = iter.next();
+            //     let e3 = iter.next();
+
+            //     if let (Some(e1), Some(e2), None) = (e1, e2, e3) {
+            //         if e1.weight() == e2.weight() {
+            //             let p0 = graph[e1.source()].position;
+            //             let p1 = graph[e1.target()].position;
+            //             let p2 = graph[e2.source()].position;
+            //             let p3 = graph[e2.target()].position;
+
+            //             if ((p1-p0).normalize_or_zero()).dot((p3-p2).normalize_or_zero()) < 0.1 {
+            //                 graph[task.source].can_snap = false;
+            //             }
+            //         }
+            //     }
+            // }
+
+            if old_target != task.target {
+                continue;
+            }
+
+            for mut new_task in global_goals_generate(&self.config, &mut rand, &self.graph, &population, task.source, target_index) {
+                new_task.priority += 1 + task.priority;
+                queue.push(new_task);
+            }
+        }
+
+        self.generator_state = GeneratorState::BuildingsInit;
+    }
+
+    fn generate_buildings_init(&mut self) {
+        if !self.config.generate_buildings {
+            self.generator_state = GeneratorState::ObjectsInit;
+            return;
+        }
+
+        let mut edge_indices = self.graph.edge_indices().collect::<Vec<_>>();
+        edge_indices.reverse();
+
+        self.generator_state = GeneratorState::Buildings {
+            rand: nanorand::WyRand::new_seed(self.config.seed as u64),
+            edge_indices,
+        };
+    }
+
+    fn generate_objects_init(&mut self) {
+        if !self.config.generate_trees {
+            self.generator_state = GeneratorState::Done;
+            return;
+        }
+
+        let mut edge_indices = self.graph.edge_indices().collect::<Vec<_>>();
+        edge_indices.reverse();
+
+        self.generator_state = GeneratorState::Objects {
+            rand: nanorand::WyRand::new_seed(self.config.seed as u64),
+            edge_indices,
+        };
+    }
+
+    fn generate_buildings(&mut self, until: Instant) {
+        let GeneratorState::Buildings { mut rand, mut edge_indices } = std::mem::take(&mut self.generator_state) else {
+            unreachable!();
+        };
+
+        loop {
+            if Instant::now() >= until {
+                self.generator_state = GeneratorState::Buildings { rand, edge_indices };
+                return;
+            }
+
+            let Some(edge_index) = edge_indices.pop() else {
+                break;
+            };
+
+            for _ in 0..100 {
+                let (node1, node2) = self.graph.edge_endpoints(edge_index).unwrap();
+                let mut node1 = &self.graph[node1];
+                let mut node2 = &self.graph[node2];
+
+                if rand.generate::<bool>() {
+                    (node1, node2) = (node2, node1);
+                }
+
+                let (size, mesh) = match rand.generate::<f32>() {
+                    0.0..0.2 => (Vec2::new(35.438, 12.4346), "buildings/building1.glb".into()),
+                    0.2..0.4 => (Vec2::new(37.788, 9.65812), "buildings/building2.glb".into()),
+                    0.4..0.7 => (Vec2::new(23.2295, 16.0061), "buildings/building31.glb".into()),
+                    0.7..1.0 => (Vec2::new(23.2295, 16.0061), "buildings/building32.glb".into()),
+                    _ => unreachable!(),
+                };
+                let size = size.yx(); // TODO: wrong orientation
+
+                let t = rand.generate::<f32>();
+                let position = node1.position + (node2.position - node1.position) * t;
+                let offset_from_way = size.y / 2. + 5.;
+                let offset = (node2.position - node1.position).normalize_or_zero().perp() * offset_from_way;
+                let position = position - offset;
+                let angle = (node1.position - node2.position).to_angle();
+                let node1_position = node1.position;
+                let node2_position = node2.position;
+
+                // debug
+                // network.buildings.push(BuildingInfo {
+                //     position,
+                //     orientation: angle.into(),
+                //     size,
+                //     color: css::BLUE.into(),
+                // });
+
+                let shape_pos = Isometry2::new(Vector2::new(position.x, position.y), angle);
+                let shape = rapier2d::parry::shape::Cuboid::new(Vector2::new(size.x / 2., size.y / 2.));
+                let place_along_line = Vector2::new(node1.position.x - node2.position.x, node1.position.y - node2.position.y);
+                self.update_pipeline();
+
+                let filter = QueryFilter::default()
+                    .groups(InteractionGroups::new(Group::all(), RAPIER_GROUP_WAY_CENTERLINE | RAPIER_GROUP_BUILDING));
+                let placement = self.calculate_placement(shape_pos, &shape, filter, Some(place_along_line));
+                let mut placed = false;
+
+                if let Some(placement) = placement {
+                    let position = Vec2::new(placement.x, placement.y);
+                    // inverse-lerp to calculate new t, make sure it's still inside segment
+                    let new_t = (position - node1_position).dot(node2_position - node1_position) / (node2_position - node1_position).length_squared();
+
+                    if (0.0..=1.0).contains(&new_t) {
+                        self.add_building(BuildingInfo {
+                            position,
+                            orientation: angle.into(),
+                            size,
+                            color: css::DARK_MAGENTA.into(),
+                            mesh,
+                            offset_from_way,
+                        });
+                        placed = true;
+                    }
+                }
+
+                if !placed {
+                    break;
+                }
+            }
+        }
+
+        self.generator_state = GeneratorState::ObjectsInit;
+    }
+
+    fn generate_objects(&mut self, until: Instant) {
+        let GeneratorState::Objects { mut rand, mut edge_indices } = std::mem::take(&mut self.generator_state) else {
+            unreachable!();
+        };
+
+        loop {
+            if Instant::now() >= until {
+                self.generator_state = GeneratorState::Objects { rand, edge_indices };
+                return;
+            }
+
+            let Some(edge_index) = edge_indices.pop() else {
+                break;
+            };
+
+            for _ in 0..100 {
+                let (node1, node2) = self.graph.edge_endpoints(edge_index).unwrap();
+                let mut node1 = &self.graph[node1];
+                let mut node2 = &self.graph[node2];
+
+                if rand.generate::<bool>() {
+                    (node1, node2) = (node2, node1);
+                }
+
+                let (size, mesh) = match rand.generate::<f32>() {
+                    0.0..0.5 => (2., "trees/tree_a.glb".into()),
+                    0.5..1.0 => (2., "trees/tree_b.glb".into()),
+                    _ => unreachable!(),
+                };
+
+                let t = rand.generate::<f32>();
+                let position = node1.position + (node2.position - node1.position) * t;
+                let offset = (node2.position - node1.position).normalize_or_zero().perp() * (size / 2. + 3. + 6. * rand.generate::<f32>());
+                let position = position - offset;
+                let angle = (node2.position - node1.position).to_angle();
+                let node1_position = node1.position;
+                let node2_position = node2.position;
+
+                // debug
+                // network.buildings.push(BuildingInfo {
+                //     position,
+                //     orientation: angle.into(),
+                //     size,
+                //     color: css::BLUE.into(),
+                // });
+
+                let shape_pos = Isometry2::new(Vector2::new(position.x, position.y), angle);
+                let shape = rapier2d::parry::shape::Ball::new(size);
+                let place_along_line = Vector2::new(node1.position.x - node2.position.x, node1.position.y - node2.position.y);
+                self.update_pipeline();
+
+                let filter = QueryFilter::default()
+                    .groups(InteractionGroups::new(Group::all(), RAPIER_GROUP_WAY_CENTERLINE | RAPIER_GROUP_BUILDING));
+                let placement = self.calculate_placement(shape_pos, &shape, filter, Some(place_along_line));
+                let mut placed = false;
+
+                if let Some(placement) = placement {
+                    let position = Vec2::new(placement.x, placement.y);
+                    // inverse-lerp to calculate new t, make sure it's still inside segment
+                    let new_t = (position - node1_position).dot(node2_position - node1_position) / (node2_position - node1_position).length_squared();
+
+                    if (0.0..=1.0).contains(&new_t) {
+                        self.add_object(ObjectInfo {
+                            position,
+                            orientation: angle.into(),
+                            size,
+                            mesh,
+                        });
+                        placed = true;
+                    }
+                }
+
+                if !placed {
+                    break;
+                }
+            }
+        }
+
+        self.generator_state = GeneratorState::Done;
+    }
+
     pub fn add_node(&mut self, position: Vec2) -> NodeIndex {
         let node = self.graph.add_node(NodeInfo { position, can_snap: true });
         // self.tree.insert(GeomWithData::new([position.x, position.y], node));
         let collider = self.colliders.insert(
-            ColliderBuilder::ball(MAX_SNAP_DISTANCE)
+            ColliderBuilder::ball(self.config.max_snap_distance)
                 .translation(Vector2::new(position.x, position.y))
                 .collision_groups(InteractionGroups::new(RAPIER_GROUP_INTERSECTION_SNAP, Group::all()))
                 .user_data(ColliderUserData::NodeIndex(node).into())
@@ -198,6 +628,18 @@ impl RoadNetwork {
                 .build()
         );
         self.buildings.push(building);
+        self.modified_colliders.push(collider);
+    }
+
+    pub fn add_object(&mut self, object: ObjectInfo) {
+        let collider = self.colliders.insert(
+            ColliderBuilder::ball(object.size)
+                .translation(Vector2::new(object.position.x, object.position.y))
+                .rotation(object.orientation.as_radians())
+                .collision_groups(InteractionGroups::new(RAPIER_GROUP_BUILDING, Group::all()))
+                .build()
+        );
+        self.objects.push(object);
         self.modified_colliders.push(collider);
     }
 
@@ -252,6 +694,8 @@ impl RoadNetwork {
         };
 
         let collider = self.colliders.get(collider_handle)?;
+        let minimum_intersection_deviation = self.config.minimum_intersection_deviation.sin();
+
         match ColliderUserData::from(collider.user_data) {
             ColliderUserData::NodeIndex(node_index) => {
                 let node = self.graph.node_weight(node_index)?;
@@ -263,7 +707,7 @@ impl RoadNetwork {
                     let start = self.graph[source].position;
                     let end = self.graph[target].position;
                     let new_dot = ((end - start).normalize_or_zero().dot((new_target - source_pos).normalize_or_zero())).abs();
-                    if new_dot < MINIMUM_INTERSECTION_DEVIATION.sin() {
+                    if new_dot < minimum_intersection_deviation {
                         return None;
                     }
                 }
@@ -284,7 +728,7 @@ impl RoadNetwork {
                 let end = self.graph[target].position;
                 let new_dot = ((end - start).normalize_or_zero().dot((new_target - source_pos).normalize_or_zero())).abs();
 
-                if new_dot < MINIMUM_INTERSECTION_DEVIATION.sin() {
+                if new_dot < minimum_intersection_deviation {
                     return None;
                 }
 
@@ -385,177 +829,16 @@ impl Ord for CheckTask {
     }
 }
 
-pub fn generate_segments(segment_count_limit: usize) -> RoadNetwork {
-    let mut rand = nanorand::WyRand::new_seed(1);
-    let population = noise::permutationtable::PermutationTable::new(1);//rand.generate());
-    let mut network = RoadNetwork::default();
-
-    let root_node = network.add_node(Vec2::new(0.0, 0.0));
-    let mut queue = BinaryHeap::new();
-
-    queue.push(CheckTask {
-        source: root_node,
-        target: Vec2::new(HIGHWAY_SEGMENT_LENGTH, 0.),
-        way_type: WayType::Highway,
-        priority: 0,
-    });
-    queue.push(CheckTask {
-        source: root_node,
-        target: Vec2::new(-HIGHWAY_SEGMENT_LENGTH, 0.),
-        way_type: WayType::Highway,
-        priority: 0,
-    });
-
-    while let Some(mut task) = queue.pop() {
-        if network.graph.edge_count() > segment_count_limit {
-            break;
-        }
-
-        let target_index;
-        let old_target = task.target;
-
-        if let Some((new_target, new_index)) = local_constraints_apply(
-            task.source,
-            network.graph[task.source].position,
-            task.target,
-            &mut network,
-        ) {
-            task.target = new_target;
-            target_index = new_index;
-        } else {
-            continue;
-        }
-
-        let target_index = if let Some(target_index) = target_index {
-            if network.graph.find_edge(task.source, target_index).is_some() {
-                continue;
-            }
-
-            target_index
-        } else {
-            network.add_node(task.target)
-            // network.graph.add_node(NodeInfo { position: task.target, can_snap: true })
-        };
-
-        // network.tree.insert(GeomWithData::new([task.target.x, task.target.y], target_index));
-        //network.graph.add_edge(task.source, target_index, task.way_type);
-        network.add_way(task.source, target_index, task.way_type);
-
-        // {
-        //     graph[task.source].can_snap = true;
-
-        //     let mut iter = graph.edges(task.source).fuse();
-        //     let e1 = iter.next();
-        //     let e2 = iter.next();
-        //     let e3 = iter.next();
-
-        //     if let (Some(e1), Some(e2), None) = (e1, e2, e3) {
-        //         if e1.weight() == e2.weight() {
-        //             let p0 = graph[e1.source()].position;
-        //             let p1 = graph[e1.target()].position;
-        //             let p2 = graph[e2.source()].position;
-        //             let p3 = graph[e2.target()].position;
-
-        //             if ((p1-p0).normalize_or_zero()).dot((p3-p2).normalize_or_zero()) < 0.1 {
-        //                 graph[task.source].can_snap = false;
-        //             }
-        //         }
-        //     }
-        // }
-
-        if old_target != task.target {
-            continue;
-        }
-
-        for mut new_task in global_goals_generate(&mut rand, &network.graph, &population, task.source, target_index) {
-            new_task.priority += 1 + task.priority;
-            queue.push(new_task);
-        }
-    }
-
-    let mut rand = nanorand::WyRand::new_seed(1);
-    let edge_indices = network.graph.edge_indices().collect::<Vec<_>>();
-
-    for edge_index in edge_indices {
-        for _ in 0..100 {
-            let (node1, node2) = network.graph.edge_endpoints(edge_index).unwrap();
-            let mut node1 = &network.graph[node1];
-            let mut node2 = &network.graph[node2];
-
-            if rand.generate::<bool>() {
-                (node1, node2) = (node2, node1);
-            }
-
-            let size = match rand.generate::<f32>() {
-                0.0..0.2 => Vec2::new(35.438, 12.4346),
-                0.2..0.4 => Vec2::new(37.788, 9.65812),
-                0.4..0.7 => Vec2::new(23.2295, 16.0061),
-                0.7..1.0 => Vec2::new(23.2295, 16.0061),
-                _ => unreachable!(),
-            };
-            let size = size.yx(); // TODO: wrong orientation
-
-            let t = rand.generate::<f32>();
-            let position = node1.position + (node2.position - node1.position) * t;
-            let offset = (node2.position - node1.position).normalize_or_zero().perp() * (size.y / 2. + 5.);
-            let position = position - offset;
-            let angle = (node1.position - node2.position).to_angle();
-            let node1_position = node1.position;
-            let node2_position = node2.position;
-
-            // debug
-            // network.buildings.push(BuildingInfo {
-            //     position,
-            //     orientation: angle.into(),
-            //     size,
-            //     color: css::BLUE.into(),
-            // });
-
-            let shape_pos = Isometry2::new(Vector2::new(position.x, position.y), angle);
-            let shape = rapier2d::parry::shape::Cuboid::new(Vector2::new(size.x / 2., size.y / 2.));
-            let place_along_line = Vector2::new(node1.position.x - node2.position.x, node1.position.y - node2.position.y);
-            network.update_pipeline();
-
-            let filter = QueryFilter::default()
-                .groups(InteractionGroups::new(Group::all(), RAPIER_GROUP_WAY_CENTERLINE | RAPIER_GROUP_BUILDING));
-            let placement = network.calculate_placement(shape_pos, &shape, filter, Some(place_along_line));
-            let mut placed = false;
-
-            if let Some(placement) = placement {
-                let position = Vec2::new(placement.x, placement.y);
-                // inverse-lerp to calculate new t, make sure it's still inside segment
-                let new_t = (position - node1_position).dot(node2_position - node1_position) / (node2_position - node1_position).length_squared();
-
-                if (0.0..=1.0).contains(&new_t) {
-                    network.add_building(BuildingInfo {
-                        position,
-                        orientation: angle.into(),
-                        size,
-                        color: css::DARK_MAGENTA.into(),
-                    });
-                    placed = true;
-                }
-            }
-
-            if !placed {
-                break;
-            }
-        }
-    }
-
-    network
-}
-
 pub fn draw_segments(
     gizmos: &mut Gizmos,
     network: &RoadNetwork,
 ) {
     for node in network.graph.node_indices() {
         let position = network.graph[node].position;
-        let color = if network.graph[node].can_snap { css::GREEN } else { css::RED };
+        let color = if network.graph[node].can_snap { css::DARK_SLATE_BLUE } else { css::RED };
         // gizmos.circle_2d(position, 10., color);
         // gizmos.circle_2d(position, 9., color);
-        gizmos.circle_2d(position, 8., color);
+        gizmos.circle_2d(position, 5., color);
     }
 
     for edge in network.graph.edge_indices() {
@@ -571,11 +854,15 @@ pub fn draw_segments(
 
     for building in network.buildings.iter() {
         gizmos.rect_2d(building.position, building.orientation, building.size, building.color);
-        gizmos.line_2d(building.position, building.position + (Vec2::X * 20.).rotate((building.orientation.inverse()).sin_cos().into()), css::DARK_BLUE);
+        gizmos.line_2d(building.position, building.position - (Vec2::X * building.offset_from_way).rotate((building.orientation.inverse()).sin_cos().into()), css::DARK_BLUE);
         // gizmos.circle_2d(building.position, 20., css::GOLD);
         // gizmos.circle_2d(building.position, 19., css::GOLD);
         // gizmos.circle_2d(building.position, 18., css::GOLD);
         // gizmos.circle_2d(building.position, 17., css::GOLD);
+    }
+
+    for object in network.objects.iter() {
+        gizmos.circle_2d(object.position, object.size, css::GREEN);
     }
 }
 
@@ -674,6 +961,7 @@ pub fn local_constraints_apply(
 }
 
 fn global_goals_generate(
+    config: &GeneratorConfig,
     rand: &mut nanorand::WyRand,
     graph: &petgraph::Graph<NodeInfo, WayType, Undirected>,
     population: &noise::permutationtable::PermutationTable,
@@ -689,16 +977,17 @@ fn global_goals_generate(
     let prev_type = graph.edges_connecting(prev_source_idx, prev_target_idx).next().unwrap().weight();
 
     let continue_straight = prev_target + (prev_target - prev_source).normalize_or_zero() * if *prev_type == WayType::Highway {
-        HIGHWAY_SEGMENT_LENGTH
+        config.highway_segment_length
     } else {
-        NORMAL_SEGMENT_LENGTH
+        config.normal_segment_length
     };
     let straight_pop = sample_population(population, prev_target);
 
     if *prev_type == WayType::Highway {
+        let straight_angle_deviation = config.straight_angle_deviation;
         let random_straight = prev_target + (prev_target - prev_source).normalize_or_zero().rotate(
-            Vec2::from_angle(rand.generate::<f32>() * STRAIGHT_ANGLE_DEVIATION * 2. - STRAIGHT_ANGLE_DEVIATION)
-        ) * HIGHWAY_SEGMENT_LENGTH;
+            Vec2::from_angle(rand.generate::<f32>() * straight_angle_deviation * 2. - straight_angle_deviation)
+        ) * config.highway_segment_length;
         let random_pop = sample_population(population, random_straight);
         let road_pop = if random_pop > straight_pop {
             tasks.push(CheckTask {
@@ -718,14 +1007,15 @@ fn global_goals_generate(
             straight_pop
         };
 
-        if road_pop > HIGHWAY_BRANCH_POPULATION_THRESHOLD {
+        if road_pop > config.highway_branch_population_threshold {
             for direction in [-1, 1] {
-                if rand.generate::<f32>() >= HIGHWAY_BRANCH_PROBABILITY { continue; }
+                if rand.generate::<f32>() >= config.highway_branch_probability { continue; }
 
-                let random_angle = rand.generate::<f32>() * BRANCH_ANGLE_DEVIATION * 2. - BRANCH_ANGLE_DEVIATION;
+                let branch_angle_deviation = config.branch_angle_deviation;
+                let random_angle = rand.generate::<f32>() * branch_angle_deviation * 2. - branch_angle_deviation;
                 let branch = prev_target + (prev_target - prev_source).normalize_or_zero().rotate(
                     Vec2::from_angle(direction as f32 * std::f32::consts::FRAC_PI_2 + random_angle)
-                ) * HIGHWAY_SEGMENT_LENGTH;
+                ) * config.highway_segment_length;
 
                 tasks.push(CheckTask {
                     source: prev_target_idx,
@@ -735,7 +1025,7 @@ fn global_goals_generate(
                 });
             }
         }
-    } else if straight_pop > NORMAL_BRANCH_POPULATION_THRESHOLD {
+    } else if straight_pop > config.normal_branch_population_threshold {
         tasks.push(CheckTask {
             source: prev_target_idx,
             target: continue_straight,
@@ -744,21 +1034,22 @@ fn global_goals_generate(
         });
     }
 
-    if straight_pop > NORMAL_BRANCH_POPULATION_THRESHOLD {
+    if straight_pop > config.normal_branch_population_threshold {
         for direction in [-1, 1] {
-            if rand.generate::<f32>() >= NORMAL_BRANCH_PROBABILITY { continue; }
+            if rand.generate::<f32>() >= config.normal_branch_probability { continue; }
 
-            let random_angle = rand.generate::<f32>() * BRANCH_ANGLE_DEVIATION * 2. - BRANCH_ANGLE_DEVIATION;
+            let branch_angle_deviation = config.branch_angle_deviation;
+            let random_angle = rand.generate::<f32>() * branch_angle_deviation * 2. - branch_angle_deviation;
             let branch = prev_target + (prev_target - prev_source).normalize_or_zero().rotate(
                 Vec2::from_angle(direction as f32 * std::f32::consts::FRAC_PI_2 + random_angle)
-            ) * NORMAL_SEGMENT_LENGTH;
+            ) * config.normal_segment_length;
 
             tasks.push(CheckTask {
                 source: prev_target_idx,
                 target: branch,
                 way_type: WayType::Normal,
                 priority: if *prev_type == WayType::Highway {
-                    NORMAL_BRANCH_TIME_DELAY_FROM_HIGHWAY
+                    config.normal_branch_time_delay_from_highway
                 } else {
                     0
                 },

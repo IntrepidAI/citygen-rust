@@ -8,20 +8,30 @@ use bevy::input::common_conditions::input_toggle_active;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_inspector_egui::bevy_egui::EguiContexts;
+use bevy_inspector_egui::egui::{Color32, DragValue, Slider, Spinner};
 use bevy_mod_raycast::prelude::*;
+use city_gen::GeneratorConfig;
 
 use crate::city_gen::WayType;
 use crate::pan_camera::{PanCamera, PanCamera2dBundle};
 
+const GENERATOR_ITERATION_TIMEOUT: Duration = Duration::from_millis(50);
+
 mod city_gen;
 mod pan_camera;
+
+#[derive(Resource, Default)]
+struct CurrentGeneratorConfig(GeneratorConfig);
 
 #[derive(Resource)]
 struct RoadNetworkResource(crate::city_gen::RoadNetwork);
 
 impl RoadNetworkResource {
-    fn new(segment_count_limit: usize) -> Self {
-        Self(city_gen::generate_segments(segment_count_limit))
+    fn new(config: GeneratorConfig) -> Self {
+        // Self(city_gen::generate_segments(config))
+        let mut network = city_gen::RoadNetwork::new(config);
+        network.generate(GENERATOR_ITERATION_TIMEOUT / 4);
+        Self(network)
     }
 
     fn to_lua(&self) -> String {
@@ -40,7 +50,21 @@ impl RoadNetworkResource {
 
             result.push(format!(
                 "map.spawn_road {{ src = {{ {}, {} }}, dst = {{ {}, {} }}, highway = {} }}",
-                a.position.x / 4., a.position.y / 4., b.position.x / 4., b.position.y / 4., is_highway
+                a.position.x, a.position.y, b.position.x, b.position.y, false//is_highway
+            ));
+        }
+
+        for building in &self.0.buildings {
+            result.push(format!(
+                "map.spawn {{ mesh = \"{}\", position = {{ x = {}, y = {} }}, rotation = {{ yaw = {} }} }}",
+                building.mesh, building.position.x, building.position.y, building.orientation.as_degrees()
+            ));
+        }
+
+        for object in &self.0.objects {
+            result.push(format!(
+                "map.spawn {{ mesh = \"{}\", position = {{ x = {}, y = {} }}, rotation = {{ yaw = {} }} }}",
+                object.mesh, object.position.x, object.position.y, object.orientation.as_degrees()
             ));
         }
 
@@ -77,6 +101,9 @@ fn main() {
         .add_systems(Update, mouse_move)
         .add_systems(Update, show_gizmos)
         .add_systems(Update, ui)
+        .add_systems(Update, |mut network: ResMut<RoadNetworkResource>| {
+            network.0.generate(GENERATOR_ITERATION_TIMEOUT);
+        })
         .insert_resource(ClearColor(Color::srgb(0., 0., 0.)))
         .insert_resource(AmbientLight {
             color: Color::WHITE,
@@ -84,44 +111,170 @@ fn main() {
         })
         .insert_resource(Msaa::default())
         // .insert_resource(MapFile(file))
-        .insert_resource(RoadNetworkResource::new(400))
+        .insert_resource(CurrentGeneratorConfig::default())
+        .insert_resource(RoadNetworkResource::new(GeneratorConfig::default()))
         .init_resource::<Highlighted>()
         .run();
+}
+
+struct UiSettings {
+    auto_generate: bool,
+    filename: String,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            auto_generate: true,
+            filename: "map.lua".to_string(),
+        }
+    }
 }
 
 fn ui(
     mut commands: Commands,
     mut egui_contexts: EguiContexts,
-    mut limit: Local<usize>,
-    mut limit_txt: Local<String>,
+    mut settings: ResMut<CurrentGeneratorConfig>,
+    mut ui_settings: Local<UiSettings>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    camera_query: Query<(&Camera, &GlobalTransform)>,
+    mut network: ResMut<RoadNetworkResource>,
 ) {
     let Some(ctx) = egui_contexts.try_ctx_mut() else { return };
 
     bevy_inspector_egui::egui::Window::new("")
         .title_bar(false)
         .auto_sized()
+        .max_width(250.)
         .show(ctx, |ui| {
-            if ui.text_edit_singleline(&mut *limit_txt).changed() {
-                if let Ok(value) = limit_txt.parse() {
-                    *limit = value;
-                }
-            }
+            let mut changed = false;
 
-            if ui.button("regenerate").clicked() {
-                *limit += 1;
-                *limit_txt = limit.to_string();
-                commands.insert_resource(RoadNetworkResource::new(*limit));
-            }
+            ui.horizontal(|ui| {
+                ui.label("seed:");
+                changed |= ui.add(DragValue::new(&mut settings.0.seed).speed(1.0)).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("segments:");
+                changed |= ui.add(DragValue::new(&mut settings.0.segment_count_limit).speed(1.0)).changed();
+            });
+
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(&mut settings.0.generate_buildings, "generate buildings").changed();
+                ui.label("(slow)");
+            });
+
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(&mut settings.0.generate_trees, "generate trees").changed();
+                ui.label("(slow)");
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("branch angle deviation:");
+                changed |= ui.drag_angle(&mut settings.0.branch_angle_deviation).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("straight angle deviation:");
+                changed |= ui.drag_angle(&mut settings.0.straight_angle_deviation).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("minimum intersection deviation:");
+                changed |= ui.drag_angle(&mut settings.0.minimum_intersection_deviation).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("normal segment length:");
+                changed |= ui.add(DragValue::new(&mut settings.0.normal_segment_length).speed(1.0)).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("highway segment length:");
+                changed |= ui.add(DragValue::new(&mut settings.0.highway_segment_length).speed(1.0)).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("max snap distance:");
+                changed |= ui.add(DragValue::new(&mut settings.0.max_snap_distance).speed(1.0)).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("normal branch probability:");
+                changed |= ui.add(Slider::new(&mut settings.0.normal_branch_probability, 0.0..=1.0)).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("highway branch probability:");
+                changed |= ui.add(Slider::new(&mut settings.0.highway_branch_probability, 0.0..=1.0)).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("normal branch pop threshold:");
+                changed |= ui.add(Slider::new(&mut settings.0.normal_branch_population_threshold, 0.0..=1.0)).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("highway branch pop threshold:");
+                changed |= ui.add(Slider::new(&mut settings.0.highway_branch_population_threshold, 0.0..=1.0)).changed();
+            });
+
+            ui.horizontal(|ui| {
+                if network.0.is_generating() {
+                    if ui.button("stop").clicked() {
+                        network.0.stop_generating();
+                    }
+
+                    ui.add(Spinner::new().color(Color32::DARK_GRAY));
+                } else {
+                    if ui.button("generate").clicked() || (ui_settings.auto_generate && changed) {
+                        // *limit += 1;
+                        // *limit_txt = limit.to_string();
+                        commands.insert_resource(RoadNetworkResource::new(settings.0.clone()));
+                    }
+
+                    changed |= ui.checkbox(&mut ui_settings.auto_generate, "auto").changed();
+                }
+            });
+
+            ui.separator();
+
+            ui.text_edit_singleline(&mut ui_settings.filename);
 
             if ui.button("write to file").clicked() {
+                let filename = ui_settings.filename.clone();
                 commands.add(|world: &mut World| {
                     let network = world.get_resource::<RoadNetworkResource>().unwrap();
-                    let mut file = std::fs::File::create("map.lua").unwrap();
+                    let mut file = std::fs::File::create(filename).unwrap();
                     let text = network.to_lua();
                     use std::io::Write;
                     file.write_all(text.as_bytes()).unwrap();
                 });
             }
+
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                let mouse_position: Option<Vec2> = (|| {
+                    let window = window_query.get_single().ok()?;
+                    let (camera, gxform) = camera_query.get_single().ok()?;
+                    let cursor_position = window.cursor_position()?;
+                    let cursor_ray = camera.viewport_to_world(gxform, cursor_position)?;
+                    let position = cursor_ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Z))
+                        .map(|pos| cursor_ray.origin + cursor_ray.direction * pos);
+                    position.map(|pos| Vec2::new(pos.x, pos.y))
+                })();
+
+                ui.label("mouse at");
+                if let Some(mouse_position) = mouse_position {
+                    ui.label(format!(
+                        "x: {:.2}, y: {:.2}",
+                        mouse_position.x, mouse_position.y
+                    ));
+                } else {
+                    ui.label("n/a");
+                }
+            });
         });
 }
 
@@ -136,14 +289,14 @@ fn show_gizmos(
 
     crate::city_gen::draw_segments(&mut gizmos, &network.0);
 
-    let intersect = (|| {
-        let window = window_query.get_single().ok()?;
-        let (camera, gxform) = camera_query.get_single().ok()?;
-        let cursor_position = window.cursor_position()?;
-        let cursor_ray = camera.viewport_to_world(gxform, cursor_position)?;
-        cursor_ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Z))
-            .map(|pos| cursor_ray.origin + cursor_ray.direction * pos)
-    })();
+    // let intersect = (|| {
+    //     let window = window_query.get_single().ok()?;
+    //     let (camera, gxform) = camera_query.get_single().ok()?;
+    //     let cursor_position = window.cursor_position()?;
+    //     let cursor_ray = camera.viewport_to_world(gxform, cursor_position)?;
+    //     cursor_ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Z))
+    //         .map(|pos| cursor_ray.origin + cursor_ray.direction * pos)
+    // })();
 
     // if let Some(intersect) = intersect {
     //     let p1 = Vec2::new(10000., 10000.);
@@ -153,17 +306,17 @@ fn show_gizmos(
     //     }
     // }
 
-    bevy_inspector_egui::egui::Window::new("x")
-        .title_bar(false)
-        .auto_sized()
-        .show(ctx, |ui| {
-            ui.label(format!("{intersect:?}"));
-            if let Some(intersect) = intersect {
-                let intersect = intersect.truncate();
-                let population = noise::permutationtable::PermutationTable::new(1);//rand.generate());
-                ui.label(format!("{:?}", city_gen::sample_population(&population, intersect)));
-            }
-        });
+    // bevy_inspector_egui::egui::Window::new("x")
+    //     .title_bar(false)
+    //     .auto_sized()
+    //     .show(ctx, |ui| {
+    //         ui.label(format!("{intersect:?}"));
+    //         if let Some(intersect) = intersect {
+    //             let intersect = intersect.truncate();
+    //             let population = noise::permutationtable::PermutationTable::new(1);//rand.generate());
+    //             ui.label(format!("{:?}", city_gen::sample_population(&population, intersect)));
+    //         }
+    //     });
 }
 
 fn spawn_environment(mut commands: Commands) {
@@ -207,6 +360,7 @@ struct Highlighted {
 }
 
 fn mouse_move(
+    // mut commands: Commands,
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform)>,
     mut raycast: Raycast,
@@ -218,9 +372,44 @@ fn mouse_move(
     parents: Query<&Parent>,
     children: Query<&Children>,
     mut egui_contexts: EguiContexts,
+    // mut network: ResMut<RoadNetworkResource>,
 ) {
     let Some(ctx) = egui_contexts.try_ctx_mut() else { return };
     if ctx.wants_pointer_input() { return };
+
+//     {
+//         // let mut network = RoadNetworkResource::new(1);
+
+//         let mouse_position: Option<Vec2> = (|| {
+//             let window = window_query.get_single().ok()?;
+//             let (camera, gxform) = camera_query.get_single().ok()?;
+//             let cursor_position = window.cursor_position()?;
+//             let cursor_ray = camera.viewport_to_world(gxform, cursor_position)?;
+//             let position = cursor_ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Z))
+//                 .map(|pos| cursor_ray.origin + cursor_ray.direction * pos);
+//             position.map(|pos| Vec2::new(pos.x, pos.y))
+//         })();
+//         let Some(mouse_position) = mouse_position else { return };
+
+//         let shape_pos = Isometry2::from_parts(Translation2::new(mouse_position.x, mouse_position.y), Default::default());
+//         let size = Vec2::new(30., 30.);
+//         let shape = rapier2d::parry::shape::Cuboid::new(Vector2::new(size.x / 2., size.y / 2.));
+//         let filter = QueryFilter::default()
+//             .groups(InteractionGroups::all().with_filter(city_gen::RAPIER_GROUP_WAY_CENTERLINE | city_gen::RAPIER_GROUP_BUILDING));
+//         let placement = network.0.calculate_placement(shape_pos, &shape, filter, None);
+// // dbg!(&placement);
+
+//         if let Some(placement) = placement {
+//             network.0.buildings.push(BuildingInfo {
+//                 position: Vec2::new(placement.x, placement.y),
+//                 orientation: 0.0.into(),
+//                 size,
+//                 color: bevy::color::palettes::css::RED.into(),
+//             });
+//             // dbg!(&network.0.buildings.len());
+//         }
+//         // commands.insert_resource(RoadNetworkResource::new(1));
+//     }
 
     if highlighted.last_time + Duration::from_millis(100) > time.elapsed() {
         return;
