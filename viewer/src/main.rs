@@ -35,7 +35,9 @@ impl RoadNetworkResource {
     }
 
     fn to_lua(&self) -> String {
-        let mut result = vec![];
+        let mut result = vec![
+            r#"local map = require("map")"#.to_string(),
+        ];
 
         for edge in self.0.graph.edge_indices() {
             let (a, b) = self.0.graph.edge_endpoints(edge).unwrap();
