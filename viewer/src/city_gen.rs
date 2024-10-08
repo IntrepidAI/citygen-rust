@@ -64,14 +64,22 @@
 //     }
 // }
 
-use std::{collections::BinaryHeap, time::{Duration, Instant}};
+use std::collections::BinaryHeap;
+use std::time::{Duration, Instant};
 
-use bevy::{color::{palettes::css, Color}, gizmos::gizmos::Gizmos, math::{Rot2, Vec2, Vec2Swizzles}, utils::HashSet};
+use bevy::color::palettes::css;
+use bevy::color::Color;
+use bevy::gizmos::gizmos::Gizmos;
+use bevy::math::{Rot2, Vec2, Vec2Swizzles};
+use bevy::utils::HashSet;
 use nalgebra::{Isometry2, Point2, Translation2, Vector2};
 use nanorand::Rng;
 use noise::core::open_simplex::open_simplex_2d;
-use petgraph::{graph::{EdgeIndex, NodeIndex}, visit::EdgeRef, Undirected};
-use rapier2d::{parry::query::ShapeCastOptions, prelude::*};
+use petgraph::graph::{EdgeIndex, NodeIndex};
+use petgraph::visit::EdgeRef;
+use petgraph::Undirected;
+use rapier2d::parry::query::ShapeCastOptions;
+use rapier2d::prelude::*;
 // use rstar::primitives::GeomWithData;
 
 // const SEGMENT_COUNT_LIMIT: usize = 20;
@@ -102,6 +110,7 @@ pub struct GeneratorConfig {
     pub highway_branch_population_threshold: f32,
     pub normal_branch_time_delay_from_highway: u32,
     pub max_snap_distance: f32,
+    pub checkpoint_count: usize,
     pub generate_buildings: bool,
     pub generate_trees: bool,
 }
@@ -122,6 +131,7 @@ impl Default for GeneratorConfig {
             highway_branch_population_threshold: 0.,
             normal_branch_time_delay_from_highway: 5,
             max_snap_distance: 30., // 50
+            checkpoint_count: 10,
             generate_buildings: true,
             generate_trees: true,
         }
@@ -212,6 +222,7 @@ pub struct RoadNetwork {
     pub graph: petgraph::Graph<NodeInfo, WayType, Undirected>,
     pub buildings: Vec<BuildingInfo>,
     pub objects: Vec<ObjectInfo>,
+    pub checkpoints: Vec<Vec2>,
     // pub tree: rstar::RTree<GeomWithData<[f32; 2], NodeIndex>>,
     // rapier2d objects
     query_pipeline: QueryPipeline,
@@ -228,6 +239,7 @@ impl Default for RoadNetwork {
             graph: petgraph::Graph::new_undirected(),
             buildings: Vec::new(),
             objects: Vec::new(),
+            checkpoints: Vec::new(),
             // tree: rstar::RTree::new(),
             query_pipeline: QueryPipeline::new(),
             rigid_bodies: RigidBodySet::new(),
@@ -389,6 +401,13 @@ impl RoadNetwork {
                 new_task.priority += 1 + task.priority;
                 queue.push(new_task);
             }
+        }
+
+        let mut node_indices = self.graph.node_indices().collect::<Vec<_>>();
+        for _ in 0..self.config.checkpoint_count {
+            if node_indices.is_empty() { break; }
+            let node_index = node_indices.remove(rand.generate_range(0..node_indices.len()));
+            self.checkpoints.push(self.graph[node_index].position);
         }
 
         self.generator_state = GeneratorState::BuildingsInit;
@@ -863,6 +882,12 @@ pub fn draw_segments(
 
     for object in network.objects.iter() {
         gizmos.circle_2d(object.position, object.size, css::GREEN);
+    }
+
+    for checkpoint in network.checkpoints.iter() {
+        gizmos.rounded_rect_2d(*checkpoint, 45.0f32.to_radians(), Vec2::new(7., 7.), css::RED);
+        gizmos.rounded_rect_2d(*checkpoint, 45.0f32.to_radians(), Vec2::new(6., 6.), css::RED);
+        gizmos.rounded_rect_2d(*checkpoint, 45.0f32.to_radians(), Vec2::new(5., 5.), css::RED);
     }
 }
 

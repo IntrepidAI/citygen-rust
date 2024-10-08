@@ -68,6 +68,13 @@ impl RoadNetworkResource {
             ));
         }
 
+        for goal in &self.0.checkpoints {
+            result.push(format!(
+                "map.spawn_goal {{ position = {{ x = {}, y = {} }}, active = true }}",
+                goal.x, goal.y
+            ));
+        }
+
         result.join("\n")
     }
 }
@@ -157,6 +164,11 @@ fn ui(
             ui.horizontal(|ui| {
                 ui.label("segments:");
                 changed |= ui.add(DragValue::new(&mut settings.0.segment_count_limit).speed(1.0)).changed();
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("checkpoints:");
+                changed |= ui.add(DragValue::new(&mut settings.0.checkpoint_count).speed(1.0)).changed();
             });
 
             ui.horizontal(|ui| {
