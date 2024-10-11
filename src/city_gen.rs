@@ -660,7 +660,7 @@ impl RoadNetwork {
     // Cast a ray from a source node to target position,
     //  - if the ray hits intersection collider (ball with radius=snap-distance), retarget to the intersection point
     //  - if the ray hits network way (line segment), retarget to the intersection point
-    fn find_snapping(&mut self, source: NodeIndex, target: Vec2) -> Option<(Vec2, Option<NodeIndex>)> {
+    pub fn find_snapping(&mut self, source: NodeIndex, target: Vec2) -> Option<(Vec2, Option<NodeIndex>)> {
         self.update_pipeline();
 
         // let source_collider = self.graph[source].snapping_collider;

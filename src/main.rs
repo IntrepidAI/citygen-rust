@@ -1,13 +1,17 @@
 #![allow(clippy::too_many_arguments)]
 use std::time::Duration;
 
+use bevy::color::palettes::css;
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::input::common_conditions::input_toggle_active;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_inspector_egui::bevy_egui::EguiContexts;
 use bevy_inspector_egui::egui::{Color32, DragValue, Slider, Spinner};
-use city_gen::GeneratorConfig;
+use city_gen::{GeneratorConfig, RAPIER_GROUP_BUILDING, RAPIER_GROUP_WAY_CENTERLINE};
+use petgraph::graph::NodeIndex;
+use rapier2d::na::{Isometry2, Vector2};
+use rapier2d::prelude::{Group, InteractionGroups, QueryFilter};
 
 use crate::pan_camera::{PanCamera, PanCamera2dBundle};
 
@@ -15,6 +19,15 @@ const GENERATOR_ITERATION_TIMEOUT: Duration = Duration::from_millis(50);
 
 mod city_gen;
 mod pan_camera;
+
+#[derive(Resource, Default)]
+pub enum DebugState {
+    #[default]
+    None,
+    PlaceNode,
+    ConnectNode(NodeIndex),
+    PlaceBuilding,
+}
 
 #[derive(Resource, Default)]
 struct CurrentGeneratorConfig(GeneratorConfig);
@@ -106,6 +119,8 @@ fn main() {
                 network.saved = None;
             }
         })
+        .add_systems(Update, visual_debugging)
+        .init_resource::<DebugState>()
         .insert_resource(ClearColor(Color::srgb(0., 0., 0.)))
         // .insert_resource(AmbientLight {
         //     color: Color::WHITE,
@@ -135,6 +150,7 @@ fn ui(
     mut commands: Commands,
     mut egui_contexts: EguiContexts,
     mut settings: ResMut<CurrentGeneratorConfig>,
+    mut state: ResMut<DebugState>,
     mut ui_settings: Local<UiSettings>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform)>,
@@ -234,6 +250,7 @@ fn ui(
                 } else {
                     if ui.button("generate").clicked() || (ui_settings.auto_generate && changed) {
                         commands.insert_resource(RoadNetworkResource::new(settings.0.clone()));
+                        *state = DebugState::None;
                     }
 
                     changed |= ui.checkbox(&mut ui_settings.auto_generate, "auto").changed();
@@ -283,11 +300,17 @@ fn ui(
                     ui.label("n/a");
                 }
             });
-        });
-}
 
-fn show_gizmos(mut gizmos: Gizmos, network: Res<RoadNetworkResource>) {
-    crate::city_gen::draw_segments(&mut gizmos, &network.network);
+            ui.horizontal(|ui| {
+                if ui.button("place roads").clicked() {
+                    *state = DebugState::PlaceNode;
+                }
+
+                if ui.button("place buildings").clicked() {
+                    *state = DebugState::PlaceBuilding;
+                }
+            });
+        });
 }
 
 fn spawn_environment(mut commands: Commands) {
@@ -298,4 +321,60 @@ fn spawn_environment(mut commands: Commands) {
         },
         ..default()
     });
+}
+
+fn show_gizmos(mut gizmos: Gizmos, network: Res<RoadNetworkResource>) {
+    crate::city_gen::draw_segments(&mut gizmos, &network.network);
+}
+
+fn visual_debugging(
+    mut gizmos: Gizmos,
+    mut network: ResMut<RoadNetworkResource>,
+    mut state: ResMut<DebugState>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    camera_query: Query<(&Camera, &GlobalTransform)>,
+) {
+    let mouse_position: Option<Vec2> = (|| {
+        let window = window_query.get_single().ok()?;
+        let (camera, gxform) = camera_query.get_single().ok()?;
+        let cursor_position = window.cursor_position()?;
+        let cursor_ray = camera.viewport_to_world(gxform, cursor_position)?;
+        let position = cursor_ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Z))
+            .map(|pos| cursor_ray.origin + cursor_ray.direction * pos);
+        position.map(|pos| Vec2::new(pos.x, pos.y))
+    })();
+
+    let Some(mouse_position) = mouse_position else { return };
+
+    match *state {
+        DebugState::None => {}
+        DebugState::PlaceNode => {
+            let new_node = network.network.add_node(mouse_position);
+            *state = DebugState::ConnectNode(new_node);
+        }
+        DebugState::ConnectNode(source) => {
+            if let Some(source_pos) = network.network.graph.node_weight(source).map(|node| node.position) {
+                let snapping = network.network.find_snapping(source, mouse_position);
+                let new_target = if let Some((target, _)) = snapping {
+                    target
+                } else {
+                    mouse_position
+                };
+                gizmos.line_2d(source_pos, new_target, css::AQUAMARINE);
+            }
+        }
+        DebugState::PlaceBuilding => {
+            let filter = QueryFilter::default()
+                .groups(InteractionGroups::new(Group::all(), RAPIER_GROUP_WAY_CENTERLINE | RAPIER_GROUP_BUILDING));
+
+            if let Some(placement) = network.network.calculate_placement(
+                Isometry2::translation(mouse_position.x, mouse_position.y),
+                &rapier2d::parry::shape::Cuboid::new(Vector2::new(20. / 2., 20. / 2.)),
+                filter,
+                None,
+            ) {
+                gizmos.rect_2d(Vec2::new(placement.x, placement.y), Rot2::default(), Vec2::new(20., 20.), css::AQUAMARINE);
+            }
+        }
+    }
 }
