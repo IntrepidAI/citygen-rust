@@ -347,12 +347,7 @@ impl RoadNetwork {
             let target_index;
             let old_target = task.target;
 
-            if let Some((new_target, new_index)) = local_constraints_apply(
-                task.source,
-                self.graph[task.source].position,
-                task.target,
-                self,
-            ) {
+            if let Some((new_target, new_index)) = self.find_snapping(task.source, task.target) {
                 task.target = new_target;
                 target_index = new_index;
             } else {
@@ -891,100 +886,6 @@ pub fn draw_segments(
     }
 }
 
-pub fn local_constraints_apply(
-    source_index: NodeIndex,
-    source: Vec2,
-    target: Vec2,
-    network: &mut RoadNetwork,
-) -> Option<(Vec2, Option<NodeIndex>)> {
-    // let p1 = source;
-    // let p2 = target;
-    // dbg!("-----------------------");
-    // dbg!(("start with", p1, p2));
-
-    // if p1.distance_squared(p2) <= MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
-    //     return None;
-    // }
-
-    // let p2_extended = p2 + (p2 - p1).normalize_or_zero() * MAX_SNAP_DISTANCE;
-    // let pmin = p1.min(p2_extended) - HIGHWAY_SEGMENT_LENGTH * Vec2::ONE;
-    // let pmax = p1.max(p2_extended) + HIGHWAY_SEGMENT_LENGTH * Vec2::ONE;
-
-    // let envelope = rstar::AABB::from_corners(pmin.into(), pmax.into());
-    // let mut new_target = None;
-    // let mut new_target_dist = f32::MAX;
-
-    // find existing segments intersecting with proposed segment,
-    // if one exist, shorten the current segment up to intersection point
-    // for point in network.tree.locate_in_envelope(&envelope) {
-    //     let node1_position = network.graph[point.data].position;
-    //     if node1_position == p1 { continue; }
-
-    //     for other in network.graph.neighbors(point.data) {
-    //         let node2_position = network.graph[other].position;
-    //         if node2_position == p1 { continue; }
-
-    //         let is = segment_intersection(p1, p2_extended, node1_position, node2_position);
-
-    //         if let Some(is) = is {
-    //             let dist = p1.distance_squared(is);
-    //             if new_target.is_none() || dist < new_target_dist {
-    //                 // dbg!("found better", is, dist);
-    //                 new_target = Some((is, (node1_position, node2_position)));
-    //                 new_target_dist = dist;
-    //             }
-    //         }
-    //     }
-    // }
-
-    // let p2 = if let Some((is, (node1_position, node2_position))) = new_target {
-    //     let angle = (is - p1).angle_between(node2_position - node1_position).abs();
-
-    //     // #[allow(clippy::manual_range_contains)]
-    //     // if angle < MINIMUM_INTERSECTION_DEVIATION || angle > std::f32::consts::PI - MINIMUM_INTERSECTION_DEVIATION {
-    //     //     return None;
-    //     // }
-
-    //     is
-    // } else {
-    //     p2
-    // };
-
-    // let pmin = p1.min(p2) - MAX_SNAP_DISTANCE * Vec2::ONE;
-    // let pmax = p1.max(p2) + MAX_SNAP_DISTANCE * Vec2::ONE;
-    // let envelope = rstar::AABB::from_corners(pmin.into(), pmax.into());
-
-    // let mut new_target = None;
-    // let mut new_target_dist = f32::MAX;
-
-    // find the closest node to the end of the segment,
-    // retarget if it is within snapping distance
-    // for point in network.tree.locate_in_envelope(&envelope) {
-    //     if !network.graph[point.data].can_snap { continue }
-    //     if *point.geom() == [p1.x, p1.y] { continue }
-
-    //     let node1_position = network.graph[point.data].position;
-
-    //     let dist = segment_point_distance_squared(p1, p2, node1_position);
-    //     if dist <= MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
-    //         let dist = p1.distance_squared(node1_position);
-    //         if dist < new_target_dist {
-    //             // dbg!(("found snap", node1_position, dist));
-    //             new_target = Some((point.data, node1_position));
-    //             new_target_dist = dist;
-    //         }
-    //     }
-    // }
-    network.find_snapping(source_index, target)
-    // ;
-
-    // if p2.distance_squared(p1) > MAX_SNAP_DISTANCE * MAX_SNAP_DISTANCE {
-    //     Some((p2, node_index))
-    // } else {
-    //     None
-    // }
-}
-
 fn global_goals_generate(
     config: &GeneratorConfig,
     rand: &mut nanorand::WyRand,
@@ -997,7 +898,6 @@ fn global_goals_generate(
 
     let prev_source = graph[prev_source_idx].position;
     let prev_target = graph[prev_target_idx].position;
-// dbg!((prev_source, prev_target, prev_source_idx, prev_target_idx));
 
     let prev_type = graph.edges_connecting(prev_source_idx, prev_target_idx).next().unwrap().weight();
 
