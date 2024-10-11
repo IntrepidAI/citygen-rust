@@ -20,14 +20,20 @@ mod pan_camera;
 struct CurrentGeneratorConfig(GeneratorConfig);
 
 #[derive(Resource)]
-struct RoadNetworkResource(crate::city_gen::RoadNetwork);
+struct RoadNetworkResource {
+    network: crate::city_gen::RoadNetwork,
+    saved: Option<String>,
+}
 
 impl RoadNetworkResource {
     fn new(config: GeneratorConfig) -> Self {
         // Self(city_gen::generate_segments(config))
         let mut network = city_gen::RoadNetwork::new(config);
         network.generate(GENERATOR_ITERATION_TIMEOUT / 4);
-        Self(network)
+        Self {
+            network,
+            saved: None,
+        }
     }
 
     fn to_lua(&self) -> String {
@@ -35,10 +41,10 @@ impl RoadNetworkResource {
             r#"local map = require("map")"#.to_string(),
         ];
 
-        for edge in self.0.graph.edge_indices() {
-            let (a, b) = self.0.graph.edge_endpoints(edge).unwrap();
-            let a = &self.0.graph[a];
-            let b = &self.0.graph[b];
+        for edge in self.network.graph.edge_indices() {
+            let (a, b) = self.network.graph.edge_endpoints(edge).unwrap();
+            let a = &self.network.graph[a];
+            let b = &self.network.graph[b];
 
             // let edge_weight = self.0.graph.edge_weight(edge).unwrap();
             // let is_highway = match edge_weight {
@@ -52,21 +58,21 @@ impl RoadNetworkResource {
             ));
         }
 
-        for building in &self.0.buildings {
+        for building in &self.network.buildings {
             result.push(format!(
                 "map.spawn {{ mesh = \"{}\", position = {{ x = {}, y = {} }}, rotation = {{ yaw = {} }} }}",
                 building.mesh, building.position.x, building.position.y, building.orientation.as_degrees()
             ));
         }
 
-        for object in &self.0.objects {
+        for object in &self.network.objects {
             result.push(format!(
                 "map.spawn {{ mesh = \"{}\", position = {{ x = {}, y = {} }}, rotation = {{ yaw = {} }} }}",
                 object.mesh, object.position.x, object.position.y, object.orientation.as_degrees()
             ));
         }
 
-        for goal in &self.0.checkpoints {
+        for goal in &self.network.checkpoints {
             result.push(format!(
                 "map.spawn_goal {{ position = {{ x = {}, y = {} }}, active = true }}",
                 goal.x, goal.y
@@ -95,7 +101,10 @@ fn main() {
         .add_systems(Update, show_gizmos)
         .add_systems(Update, ui)
         .add_systems(Update, |mut network: ResMut<RoadNetworkResource>| {
-            network.0.generate(GENERATOR_ITERATION_TIMEOUT);
+            if network.network.is_generating() {
+                network.network.generate(GENERATOR_ITERATION_TIMEOUT);
+                network.saved = None;
+            }
         })
         .insert_resource(ClearColor(Color::srgb(0., 0., 0.)))
         // .insert_resource(AmbientLight {
@@ -216,16 +225,14 @@ fn ui(
             });
 
             ui.horizontal(|ui| {
-                if network.0.is_generating() {
+                if network.network.is_generating() {
                     if ui.button("stop").clicked() {
-                        network.0.stop_generating();
+                        network.network.stop_generating();
                     }
 
                     ui.add(Spinner::new().color(Color32::DARK_GRAY));
                 } else {
                     if ui.button("generate").clicked() || (ui_settings.auto_generate && changed) {
-                        // *limit += 1;
-                        // *limit_txt = limit.to_string();
                         commands.insert_resource(RoadNetworkResource::new(settings.0.clone()));
                     }
 
@@ -240,12 +247,17 @@ fn ui(
             if ui.button("write to file").clicked() {
                 let filename = ui_settings.filename.clone();
                 commands.add(|world: &mut World| {
-                    let network = world.get_resource::<RoadNetworkResource>().unwrap();
-                    let mut file = std::fs::File::create(filename).unwrap();
+                    let mut network = world.get_resource_mut::<RoadNetworkResource>().unwrap();
+                    let mut file = std::fs::File::create(&filename).unwrap();
                     let text = network.to_lua();
                     use std::io::Write;
                     file.write_all(text.as_bytes()).unwrap();
+                    network.saved = Some(filename);
                 });
+            }
+
+            if let Some(file) = network.saved.as_ref() {
+                ui.label(format!("saved as {file}"));
             }
 
             ui.separator();
@@ -275,7 +287,7 @@ fn ui(
 }
 
 fn show_gizmos(mut gizmos: Gizmos, network: Res<RoadNetworkResource>) {
-    crate::city_gen::draw_segments(&mut gizmos, &network.0);
+    crate::city_gen::draw_segments(&mut gizmos, &network.network);
 }
 
 fn spawn_environment(mut commands: Commands) {
