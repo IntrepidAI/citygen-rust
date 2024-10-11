@@ -12,7 +12,6 @@ use bevy_inspector_egui::egui::{Color32, DragValue, Slider, Spinner};
 use bevy_mod_raycast::prelude::*;
 use city_gen::GeneratorConfig;
 
-use crate::city_gen::WayType;
 use crate::pan_camera::{PanCamera, PanCamera2dBundle};
 
 const GENERATOR_ITERATION_TIMEOUT: Duration = Duration::from_millis(50);
@@ -44,11 +43,11 @@ impl RoadNetworkResource {
             let a = &self.0.graph[a];
             let b = &self.0.graph[b];
 
-            let edge_weight = self.0.graph.edge_weight(edge).unwrap();
-            let is_highway = match edge_weight {
-                WayType::Highway => true,
-                WayType::Normal => false,
-            };
+            // let edge_weight = self.0.graph.edge_weight(edge).unwrap();
+            // let is_highway = match edge_weight {
+            //     WayType::Highway => true,
+            //     WayType::Normal => false,
+            // };
 
             result.push(format!(
                 "map.spawn_road {{ src = {{ {}, {} }}, dst = {{ {}, {} }}, highway = {} }}",

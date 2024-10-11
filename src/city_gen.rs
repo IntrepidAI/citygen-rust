@@ -118,8 +118,8 @@ pub struct GeneratorConfig {
 impl Default for GeneratorConfig {
     fn default() -> Self {
         GeneratorConfig {
-            seed: 1,
-            segment_count_limit: 20,
+            seed: 2,
+            segment_count_limit: 300,
             branch_angle_deviation: 3.0f32.to_radians(),
             straight_angle_deviation: 15.0f32.to_radians(),
             minimum_intersection_deviation: 40.0f32.to_radians(),
@@ -132,8 +132,8 @@ impl Default for GeneratorConfig {
             normal_branch_time_delay_from_highway: 5,
             max_snap_distance: 30., // 50
             checkpoint_count: 10,
-            generate_buildings: true,
-            generate_trees: true,
+            generate_buildings: false,
+            generate_trees: false,
         }
     }
 }
