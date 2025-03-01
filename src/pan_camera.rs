@@ -19,7 +19,7 @@ impl Plugin for PanCamera2dPlugin {
 #[derive(Bundle, Default)]
 pub struct PanCamera2dBundle {
     pub pan_camera: PanCamera,
-    pub camera2d: Camera2dBundle,
+    pub camera2d: Camera2d,
 }
 
 #[derive(Debug, Component, Reflect)]
@@ -81,7 +81,7 @@ fn apply_camera_controls(
         let window = window_query.get_single().ok()?;
         let (_, camera, gxform) = camera_query.get_single().ok()?;
         let cursor_position = window.cursor_position()?;
-        let cursor_ray = camera.viewport_to_world(gxform, cursor_position)?;
+        let cursor_ray = camera.viewport_to_world(gxform, cursor_position).ok()?;
         let position = cursor_ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Z))
             .map(|pos| cursor_ray.origin + cursor_ray.direction * pos);
         position.map(|pos| Vec2::new(pos.x, pos.y))
@@ -108,20 +108,20 @@ fn apply_camera_controls(
     for ev in gamepad_events.read() {
         match ev {
             GamepadEvent::Axis(ev) => {
-                match ev.axis_type {
-                    GamepadAxisType::LeftStickX => gamepad_state.left_stick_x = ev.value,
-                    GamepadAxisType::LeftStickY => gamepad_state.left_stick_y = ev.value,
-                    GamepadAxisType::RightStickX => gamepad_state.right_stick_x = ev.value,
-                    GamepadAxisType::RightStickY => gamepad_state.right_stick_y = ev.value,
+                match ev.axis {
+                    GamepadAxis::LeftStickX => gamepad_state.left_stick_x = ev.value,
+                    GamepadAxis::LeftStickY => gamepad_state.left_stick_y = ev.value,
+                    GamepadAxis::RightStickX => gamepad_state.right_stick_x = ev.value,
+                    GamepadAxis::RightStickY => gamepad_state.right_stick_y = ev.value,
                     _ => {}
                 }
             }
 
             GamepadEvent::Button(ev) => {
-                match ev.button_type {
-                    GamepadButtonType::LeftTrigger | GamepadButtonType::LeftTrigger2 =>
+                match ev.button {
+                    GamepadButton::LeftTrigger | GamepadButton::LeftTrigger2 =>
                         gamepad_state.left_trigger = ev.value,
-                    GamepadButtonType::RightTrigger | GamepadButtonType::RightTrigger2 =>
+                    GamepadButton::RightTrigger | GamepadButton::RightTrigger2 =>
                         gamepad_state.right_trigger = ev.value,
                     _ => {}
                 }
@@ -136,8 +136,8 @@ fn apply_camera_controls(
         }
     }
 
-    let gamepad_axis_multiplier = time.delta_seconds() * 1000.;
-    let gamepad_zoom_multiplier = time.delta_seconds() * 40.;
+    let gamepad_axis_multiplier = time.delta_secs() * 1000.;
+    let gamepad_zoom_multiplier = time.delta_secs() * 40.;
 
     if gamepad_state.left_stick_x != 0. || gamepad_state.left_stick_y != 0. {
         events.push(MyEvent::Pan((

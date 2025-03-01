@@ -70,7 +70,7 @@ use std::time::{Duration, Instant};
 use bevy::color::palettes::css;
 use bevy::color::Color;
 use bevy::gizmos::gizmos::Gizmos;
-use bevy::math::{Rot2, Vec2, Vec2Swizzles};
+use bevy::math::{Isometry2d, Rot2, Vec2, Vec2Swizzles};
 use bevy::utils::HashSet;
 use nalgebra::{Isometry2, Point2, Translation2, Vector2};
 use nanorand::Rng;
@@ -867,8 +867,16 @@ pub fn draw_segments(
     }
 
     for building in network.buildings.iter() {
-        gizmos.rect_2d(building.position, building.orientation, building.size, building.color);
-        gizmos.line_2d(building.position, building.position - (Vec2::X * building.offset_from_way).rotate((building.orientation.inverse()).sin_cos().into()), css::DARK_BLUE);
+        gizmos.rect_2d(
+            Isometry2d::new(building.position, building.orientation),
+            building.size,
+            building.color,
+        );
+        gizmos.line_2d(
+            building.position,
+            building.position - (Vec2::X * building.offset_from_way).rotate((building.orientation.inverse()).sin_cos().into()),
+            css::DARK_BLUE,
+        );
         // gizmos.circle_2d(building.position, 20., css::GOLD);
         // gizmos.circle_2d(building.position, 19., css::GOLD);
         // gizmos.circle_2d(building.position, 18., css::GOLD);
@@ -880,9 +888,21 @@ pub fn draw_segments(
     }
 
     for checkpoint in network.checkpoints.iter() {
-        gizmos.rounded_rect_2d(*checkpoint, 45.0f32.to_radians(), Vec2::new(7., 7.), css::RED);
-        gizmos.rounded_rect_2d(*checkpoint, 45.0f32.to_radians(), Vec2::new(6., 6.), css::RED);
-        gizmos.rounded_rect_2d(*checkpoint, 45.0f32.to_radians(), Vec2::new(5., 5.), css::RED);
+        gizmos.rounded_rect_2d(
+            Isometry2d::new(*checkpoint, Rot2::degrees(45.)),
+            Vec2::new(7., 7.),
+            css::RED,
+        );
+        gizmos.rounded_rect_2d(
+            Isometry2d::new(*checkpoint, Rot2::degrees(45.)),
+            Vec2::new(6., 6.),
+            css::RED,
+        );
+        gizmos.rounded_rect_2d(
+            Isometry2d::new(*checkpoint, Rot2::degrees(45.)),
+            Vec2::new(5., 5.),
+            css::RED,
+        );
     }
 }
 

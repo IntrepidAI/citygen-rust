@@ -126,7 +126,6 @@ fn main() {
         //     color: Color::WHITE,
         //     brightness: 300.,
         // })
-        .insert_resource(Msaa::default())
         .insert_resource(CurrentGeneratorConfig::default())
         .insert_resource(RoadNetworkResource::new(GeneratorConfig::default()))
         .run();
@@ -263,7 +262,7 @@ fn ui(
 
             if ui.button("write to file").clicked() {
                 let filename = ui_settings.filename.clone();
-                commands.add(|world: &mut World| {
+                commands.queue(|world: &mut World| {
                     let mut network = world.get_resource_mut::<RoadNetworkResource>().unwrap();
                     let mut file = std::fs::File::create(&filename).unwrap();
                     let text = network.to_lua();
@@ -284,7 +283,7 @@ fn ui(
                     let window = window_query.get_single().ok()?;
                     let (camera, gxform) = camera_query.get_single().ok()?;
                     let cursor_position = window.cursor_position()?;
-                    let cursor_ray = camera.viewport_to_world(gxform, cursor_position)?;
+                    let cursor_ray = camera.viewport_to_world(gxform, cursor_position).ok()?;
                     let position = cursor_ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Z))
                         .map(|pos| cursor_ray.origin + cursor_ray.direction * pos);
                     position.map(|pos| Vec2::new(pos.x, pos.y))
@@ -338,7 +337,7 @@ fn visual_debugging(
         let window = window_query.get_single().ok()?;
         let (camera, gxform) = camera_query.get_single().ok()?;
         let cursor_position = window.cursor_position()?;
-        let cursor_ray = camera.viewport_to_world(gxform, cursor_position)?;
+        let cursor_ray = camera.viewport_to_world(gxform, cursor_position).ok()?;
         let position = cursor_ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Z))
             .map(|pos| cursor_ray.origin + cursor_ray.direction * pos);
         position.map(|pos| Vec2::new(pos.x, pos.y))
@@ -373,7 +372,11 @@ fn visual_debugging(
                 filter,
                 None,
             ) {
-                gizmos.rect_2d(Vec2::new(placement.x, placement.y), Rot2::default(), Vec2::new(20., 20.), css::AQUAMARINE);
+                gizmos.rect_2d(
+                    Isometry2d::from_translation(Vec2::new(placement.x, placement.y)),
+                    Vec2::new(20., 20.),
+                    css::AQUAMARINE,
+                );
             }
         }
     }
